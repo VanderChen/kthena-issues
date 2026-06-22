@@ -1,0 +1,995 @@
+# ModelServing Eviction Webhook 逻辑预算保护 Feature Design
+
+## US/FE编号: 006 ModelServing Eviction Webhook 逻辑预算保护
+
+---
+
+## 1. 需求概述
+
+本特性为 Kthena `ModelServing` 增加基于 `pods/eviction` admission webhook 的逻辑中断预算保护能力，用于在节点 drain、节点迁移、OS 升级等主动驱逐场景中，避免 Kubernetes 原生 PDB 只按 Pod 数量保护而无法感知 `ServingGroup`、`Role` 等 Kthena 逻辑边界的问题。
+
+当前版本策略：
+
+- 集群级 eviction webhook 默认关闭，避免默认引入 admission 链路开销。
+- 开启后，只有显式配置 `spec.rolloutStrategy.evictionStrategy` 的 `ModelServing` 会启用保护。
+- 支持 `ServingGroup` 级保护和 `Role` 级保护。
+- `Role` 级保护支持 `roleMinAvailable`，不同 role 可配置不同的最小可用逻辑实例数。
+- 并发 drain 通过 ConfigMap-backed logical-unit tracker 处理 informer cache lag，支持 controller-manager 多副本。
+
+---
+
+## 2. 需求分析
+
+LLM 推理服务通常不是单 Pod 独立提供完整能力。一个可用实例可能由一个 `ServingGroup` 内多个 Pod，或一个 role instance 内 entry/worker 多个 Pod 共同组成。原生 PDB 只理解 Pod 数量，无法表达“任一 Pod 被驱逐后整个 ServingGroup 或 role instance 视为不可用”的语义。
+
+本特性通过拦截 Kubernetes `pods/eviction` 子资源请求，在 admission 阶段按 Kthena 逻辑单元计算可用预算。这样运维人员仍可使用 `kubectl drain` 等标准方式迁移节点，同时 Kthena 能避免短时间内多个逻辑服务实例同时失效。
+
+### 2.1 Goals & Non-Goals
+
+#### Goals
+
+- 支持 `ServingGroup` 级 `minAvailable` 保护。
+  - 验收：当 Ready ServingGroup 数量等于 `minAvailable` 时，驱逐另一个 Ready ServingGroup 的 Pod 会被拒绝。
+- 支持 `Role` 级保护，并允许不同 role 配置不同的 `roleMinAvailable`。
+  - 验收：`decode`、`prefill` 等 role 可分别定义预算；未知 role key 被 ModelServing validating webhook 拒绝。
+- `Role` 级保护按 `role-id` 逻辑实例统计，而不是按 Pod 统计。
+  - 验收：同一 `role-id` 的 entry/worker 后续 Pod 驱逐被允许，不重复消费预算；另一个 `role-id` 在预算不足时被拒绝。
+- 支持短时间多节点 drain 并发场景。
+  - 验收：第一条 eviction allow 后，在 informer 看到 Pod deletion 前，tracker 已将对应逻辑单元视为不可用。
+- 提供集群级开关。
+  - 验收：默认不渲染 `pods/eviction` webhook；开启后渲染；关闭后从 `ValidatingWebhookConfiguration` 中移除。
+- 保持标准 Kubernetes eviction 语义。
+  - 验收：拒绝时返回 admission deny 和 HTTP 429 语义，使 drain 客户端退避重试。
+
+#### Non-Goals
+
+- 不替代 Kubernetes 原生 PDB 的全部能力。
+- 不处理直接 `DELETE pod` 绕过 `pods/eviction` 的场景。
+- 不引入新的 DB 或 CRD tracker。
+- 不要求 admission Service 定向路由到 leader。
+- 不新增 UI/Console 能力。
+- 不新增计费能力。
+
+### 2.2 交付范围
+
+| 交付局点和场景 | 差异化汇总 | 备注 |
+|--------------|----------|------|
+| HC | 不涉及 | 当前为开源 Kthena/Kubernetes 集群能力设计，不区分云局点 |
+| HCS | 不涉及 | 如产品化交付，需要补充发行版配套策略 |
+| HCSO | 不涉及 | 同上 |
+| 合营云 | 不涉及 | 不涉及伙伴云差异化 API |
+| 支持企业项目 | 不涉及 | 不涉及企业项目、租户项目模型 |
+
+> 不涉及交付场景差异。
+
+### 2.3 友商分析
+
+- Kubernetes 原生 PDB：
+  - 优点：稳定、标准、与 eviction API 原生集成。
+  - 缺点：只按 Pod selector 和 Pod 数量统计，不理解 Kthena `ServingGroup`、`Role`、`role-id` 等逻辑边界。
+- Volcano gang scheduling：
+  - 优点：支持调度阶段的 gang 语义和 role 最小副本约束。
+  - 缺点：主要约束调度启动，不负责节点 drain 时的逻辑中断预算。
+- LeaderWorkerSet / Ray 等分布式工作负载：
+  - 通常会在控制器层实现组级恢复或重建，但不一定提供通用 eviction admission 保护。
+
+结论：Kthena 需要在自身 controller-manager admission webhook 中补充逻辑预算保护。
+
+### 2.4 需求约束
+
+- 依赖 Kubernetes admissionregistration v1 和 `pods/eviction` 子资源。
+- 依赖 Kthena controller-manager webhook server 可用。
+- 依赖 Pod 带有 Kthena labels：
+  - `modelserving.volcano.sh/name`
+  - `modelserving.volcano.sh/group-name`
+  - `modelserving.volcano.sh/role`
+  - `modelserving.volcano.sh/role-id`
+- `Role` 级保护要求按 `role-id` 聚合逻辑实例。
+- eviction webhook 开启时 Helm 将 controller-manager 渲染为 1 副本。
+- tracker TTL 只覆盖 informer lag，不代表 Pod termination grace period 或服务恢复时间。
+- Helm 安装后如已有 CRD，`crds/` 目录不会自动升级 CRD schema，升级时需明确 CRD 更新策略。
+
+---
+
+## 3. 解决方案
+
+整体方案是在 Kthena controller-manager webhook server 中新增 `/validate-eviction` handler，并通过 Helm 可选渲染 `ValidatingWebhookConfiguration` 中的 `pods/eviction` 规则。
+
+准入逻辑：
+
+- 解析 eviction 目标 Pod。
+- 根据 Pod label 找到所属 `ModelServing`。
+- 如果未配置 `evictionStrategy`，直接放行。
+- 如果 `protectionLevel=ServingGroup`，按 `group-name` 统计 Ready ServingGroup 数量。
+- 如果 `protectionLevel=Role`，按 `role + role-id` 统计 Ready role instance 数量。
+- 对已放行但 informer 尚未同步 deletion 的逻辑单元，通过 ConfigMap tracker 临时视为 unavailable。
+- 如果驱逐会使 Ready 逻辑单元数不满足阈值，拒绝并返回 429。
+
+### 3.1 User Stories
+
+#### 3.1.1 Story 1
+
+作为一个集群运维人员，我想要在执行节点 drain 时自动限制同一 `ModelServing` 中同时不可用的 `ServingGroup` 数量，以便节点维护不会导致推理服务容量骤降。
+
+#### 3.1.2 Story 2
+
+作为一个模型服务管理员，我想要为不同 role 配置不同的 `minAvailable`，以便 `prefill`、`decode` 等角色能按实际容量和业务重要性设置不同保护策略。
+
+#### 3.1.3 Story 3
+
+作为一个平台管理员，我想要默认关闭 eviction webhook，并在需要时通过 Helm 开启，以便在没有保护诉求的集群中不引入额外 admission 开销。
+
+#### 3.1.4 Story 4
+
+作为一个故障处理人员，我想要 webhook 拒绝时返回清晰的拒绝原因，以便快速判断是哪个 `ModelServing`、哪个 role 或 group 预算不足。
+
+### 3.2 架构影响分析
+
+| 影响项 | 是否影响(是/否) | 影响点汇总 |
+|-------|---------------|----------|
+| 架构元素 | 是 | controller-manager webhook server 增加 `/validate-eviction` admission 处理路径 |
+| 刷新特性树 | 是 | 新增 ModelServing eviction protection 能力 |
+| 刷新arch-model组件关系 | 否 | 不新增组件，仅扩展现有 controller-manager |
+| 技术选型(关键开源/三方、依赖分析与选型) | 否 | 复用 Kubernetes admission webhook、client-go informer、Helm |
+| 安全隐私 | 是 | 新增 admission 拒绝路径，需确认 RBAC/webhook 证书沿用现有机制 |
+| 其他 | 是 | 开启 eviction webhook 时 controller-manager 可多副本运行；共享预算状态由 ConfigMap tracker 保证 |
+
+### 3.3 功能规格
+
+#### 静态规格
+
+- Kubernetes：需支持 `policy/v1` Eviction 和 admissionregistration.k8s.io/v1。
+- OS：不涉及特定 OS。
+- 架构：支持 controller-manager 可编译运行的架构；Kind 实测 arm64。
+- 集群：需安装 Kthena workload CRD 和 controller-manager webhook 证书配置。
+- 调度器：测试环境使用 Volcano；本特性自身不强依赖具体 scheduler，但 `ModelServing` 示例使用 `schedulerName: volcano`。
+
+#### 兼容性关系
+
+- 与现有 `ModelServing` 兼容：未配置 `evictionStrategy` 时不改变 eviction 行为。
+- Helm 默认关闭 eviction webhook，避免升级后默认影响已有 drain 行为。
+- CRD schema 需要升级后才能接受 `roleMinAvailable` 字段。
+
+### 3.4 风险及设计约束
+
+- webhook 不可用且 `failurePolicy=Fail` 时，匹配的 eviction 请求会失败。默认关闭可降低风险。
+- ConfigMap tracker 写入依赖 kube-apiserver；API Server 写失败时 eviction webhook 会拒绝请求以避免突破预算。
+- 直接删除 Pod 不经过 `pods/eviction`，不会被此能力保护。
+- tracker TTL 太短可能不能覆盖 informer lag；太长可能保守占用预算。
+- Helm `crds/` 升级需显式处理，否则新 API 字段可能被 API Server strict decoding 拒绝。
+
+### 3.5 可选的替代方案
+
+- 原生 PDB：不满足逻辑单元保护。
+- 内存 tracker + 单 leader 路由：性能最好，但需要额外维护 leader-only Service endpoint/selector，存在 stale endpoint/label 清理复杂度；本版本不采用。
+- ConfigMap tracker：每个 ModelServing 一个 ConfigMap，使用 `resourceVersion` 冲突重试保证多副本并发一致性；本版本采用该方案。
+
+---
+
+## 4. 详细设计
+
+### 4.1 ModelServing Eviction Budget 详细设计
+
+本特性提供完整的 `ModelServing` eviction 逻辑预算保护能力。核心由四部分组成：
+
+| 模块 | 职责 | 关键输入 | 关键输出 |
+|-----|------|---------|---------|
+| ModelServing API | 声明 workload 级 eviction 保护策略 | `spec.rolloutStrategy.evictionStrategy` | `protectionLevel`、`minAvailable`、`roleMinAvailable` |
+| ModelServing validating webhook | 校验策略合法性 | ModelServing create/update | 拒绝非法 `roleMinAvailable` key 和非法 int-or-percent |
+| Eviction admission webhook | 拦截 `pods/eviction` 并执行预算判定 | Eviction admission request、Pod labels、ModelServing、Pod readiness | allow 或 deny 429 |
+| Logical-unit tracker | 覆盖 informer cache lag 下的并发 drain 窗口 | 已 allow 的逻辑单元、TTL、ConfigMap `resourceVersion` | 在 TTL 内把逻辑单元视为 unavailable，并通过冲突重试保证多副本一致性 |
+
+#### 4.1.1 配置入口和生效边界
+
+集群级开关由 Helm values 控制：
+
+- `workload.controllerManager.evictionWebhook.enabled=false` 时：
+  - Helm 不渲染 `pods/eviction` validating webhook rule。
+  - controller-manager 仍注册 allow handler 兜底，避免 webhook rule 残留时误阻塞 drain。
+  - `ModelServing.spec.rolloutStrategy.evictionStrategy` 只作为 CRD 字段存在，不影响 eviction admission。
+- `workload.controllerManager.evictionWebhook.enabled=true` 时：
+  - Helm 渲染 `eviction.modelserving.volcano.sh` webhook rule。
+  - controller-manager 通过 `--enable-eviction-webhook=true` 启用真实 handler。
+  - Helm 保留 `controllerManager.replicas` 配置，不因 eviction webhook 开启而强制单副本。
+
+单个 `ModelServing` 的保护入口是：
+
+```yaml
+spec:
+  rolloutStrategy:
+    evictionStrategy:
+      protectionLevel: Role
+      minAvailable: 1
+      roleMinAvailable:
+        prefill: 1
+        decode: 2
+```
+
+字段约束：
+
+- `protectionLevel=ServingGroup` 时，`minAvailable` 表示最少可用 ServingGroup 数量或百分比。
+- `protectionLevel=Role` 时，`roleMinAvailable[roleName]` 表示该 role 的最少可用逻辑实例数量或百分比。
+- `roleMinAvailable` 的 key 必须存在于 `spec.template.roles[*].name`。
+- `roleMinAvailable` 的 value 必须是合法 Kubernetes `IntOrString`，百分比范围为 `0%-100%`。
+
+#### 4.1.2 逻辑单元定义
+
+Webhook 不按 Pod 数量消费预算，而按 Kthena 逻辑单元消费预算。
+
+| protectionLevel | 逻辑单元 key | Ready 判定 | 预算含义 |
+|-----------------|-------------|-----------|---------|
+| `ServingGroup` | namespace + modelServing + groupName | group 内 Pod 状态满足 ServingGroup ready 规则 | 最少保留多少个 Ready ServingGroup |
+| `Role` | namespace + modelServing + role + roleID | 同一 `role + role-id` 下的 Pod 状态满足 role instance ready 规则 | 每个 role 最少保留多少个 Ready role instance |
+
+Role 模式必须使用 `role-id` 聚合。原因是一个 role instance 可能包含 entry/worker 多个 Pod；驱逐同一 `role-id` 的第二个 Pod 不应再次消费一个逻辑实例预算。
+
+#### 4.1.3 ModelServing 策略校验流程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as "User"
+    participant APIServer as "kube-apiserver"
+    participant MSWebhook as "ModelServing validating webhook"
+    participant Store as "etcd"
+
+    User->>APIServer: "create/update ModelServing"
+    APIServer->>MSWebhook: "admission review"
+    MSWebhook->>MSWebhook: "collect spec.template.roles[*].name"
+    MSWebhook->>MSWebhook: "validate roleMinAvailable keys"
+    MSWebhook->>MSWebhook: "validate IntOrString values"
+    alt "invalid strategy"
+        MSWebhook-->>APIServer: "deny with field error"
+        APIServer-->>User: "request rejected"
+    else "valid strategy"
+        MSWebhook-->>APIServer: "allow"
+        APIServer->>Store: "persist ModelServing"
+        APIServer-->>User: "success"
+    end
+```
+
+该校验放在 ModelServing validating webhook 中，而不是 eviction webhook 中延迟处理。这样非法 role key 在资源创建或更新时立即失败，避免节点维护时才暴露配置错误。
+
+#### 4.1.4 Eviction admission 总体时序
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Drain as "kubectl drain or eviction client"
+    participant APIServer as "kube-apiserver"
+    participant EvictWebhook as "Kthena eviction webhook"
+    participant PodCache as "Pod informer cache"
+    participant MSCache as "ModelServing informer cache"
+    participant Tracker as "logical-unit tracker"
+
+    Drain->>APIServer: "create pods/eviction"
+    APIServer->>EvictWebhook: "AdmissionReview"
+    EvictWebhook->>PodCache: "get target Pod"
+    EvictWebhook->>EvictWebhook: "read Kthena labels"
+    alt "not a Kthena ModelServing Pod"
+        EvictWebhook-->>APIServer: "allow"
+    else "Kthena ModelServing Pod"
+        EvictWebhook->>MSCache: "get ModelServing"
+        alt "evictionStrategy unset"
+            EvictWebhook-->>APIServer: "allow"
+        else "evictionStrategy set"
+            EvictWebhook->>PodCache: "list sibling Pods"
+            EvictWebhook->>Tracker: "remove expired entries"
+            EvictWebhook->>EvictWebhook: "calculate ready logical units"
+            EvictWebhook->>Tracker: "subtract already disrupting units"
+            alt "evicting same disrupting unit"
+                EvictWebhook-->>APIServer: "allow"
+            else "ready count would be <= minAvailable"
+                EvictWebhook-->>APIServer: "deny 429"
+            else "budget remains available"
+                EvictWebhook->>Tracker: "record logical unit with TTL"
+                EvictWebhook-->>APIServer: "allow"
+            end
+        end
+    end
+    APIServer-->>Drain: "eviction response"
+```
+
+拒绝使用 429 语义，保持 Kubernetes eviction/PDB 风格，drain 客户端可以退避后重试。
+
+#### 4.1.5 ServingGroup 模式判定算法
+
+输入：
+
+- eviction target Pod。
+- target Pod label `modelserving.volcano.sh/group-name`。
+- 同 namespace、同 ModelServing 的所有 Pod。
+- `minAvailable`。
+- tracker 中未过期的 ServingGroup logical unit。
+
+处理步骤：
+
+1. 通过 target Pod label 得到 `ModelServing` 和 target `groupName`。
+2. 列出同一 `ModelServing` 的 Pods，并按 `groupName` 聚合。
+3. 对每个 group 判断 Ready 状态，得到 Ready group 集合。
+4. 从 Ready group 集合中扣除 tracker 里未过期的 group。
+5. 如果 target group 已在 tracker 中，说明前序 eviction 已经消费该 group 预算，本次允许。
+6. 否则计算本次驱逐后的 Ready group 数量。
+7. 若数量 `<= minAvailable`，deny 429。
+8. 若数量 `> minAvailable`，allow 并把 target group 写入 tracker。
+
+```mermaid
+flowchart TD
+    A["Receive eviction for target Pod"] --> B["Resolve target ServingGroup"]
+    B --> C["List Pods of ModelServing"]
+    C --> D["Group Pods by group-name"]
+    D --> E["Build Ready ServingGroup set"]
+    E --> F["Subtract tracked disrupting groups"]
+    F --> G{"Target group already tracked?"}
+    G -->|Yes| H["Allow eviction"]
+    G -->|No| I{"Ready groups after eviction <= minAvailable?"}
+    I -->|Yes| J["Deny 429"]
+    I -->|No| K["Track target group with TTL"]
+    K --> H
+```
+
+#### 4.1.6 Role 模式判定算法
+
+输入：
+
+- eviction target Pod。
+- target Pod labels `role` 和 `role-id`。
+- 同 namespace、同 ModelServing、同 role 的所有 Pod。
+- `roleMinAvailable[targetRole]`；若该 role 未配置，则使用 `minAvailable` 作为默认阈值。
+- tracker 中未过期的 role logical unit。
+
+处理步骤：
+
+1. 通过 target Pod label 得到 `ModelServing`、target `role` 和 target `roleID`。
+2. 从 `roleMinAvailable` 读取 target role 的阈值；如果该 role 未显式配置，则读取 `minAvailable`。
+3. 列出同一 `ModelServing` 的 Pods，并筛选同 role Pods。
+4. 按 `role-id` 聚合为 role instance。
+5. 对每个 role instance 判断 Ready 状态，得到 Ready role instance 集合。
+6. 从 Ready 集合中扣除 tracker 里未过期的 `role + roleID`。
+7. 如果 target `role + roleID` 已在 tracker 中，说明同一逻辑实例已有 Pod 被允许驱逐，本次允许，不重复消费预算。
+8. 否则计算本次驱逐后的 Ready role instance 数量。
+9. 若数量 `<= target role minAvailable`，deny 429。
+10. 若数量 `> target role minAvailable`，allow 并把 target `role + roleID` 写入 tracker。
+
+```mermaid
+flowchart TD
+    A["Receive eviction for target Pod"] --> B["Resolve target role and role-id"]
+    B --> C["Read roleMinAvailable for target role"]
+    C --> D["Use minAvailable if unset"]
+    D --> E["List Pods of ModelServing"]
+    E --> F["Filter Pods by target role"]
+    F --> G["Group Pods by role-id"]
+    G --> H["Build Ready role-instance set"]
+    H --> I["Subtract tracked disrupting role instances"]
+    I --> J{"Target role-id already tracked?"}
+    J -->|Yes| K["Allow eviction"]
+    J -->|No| L{"Ready instances after eviction <= role minAvailable?"}
+    L -->|Yes| M["Deny 429"]
+    L -->|No| N["Track target role-id with TTL"]
+    N --> K
+```
+
+#### 4.1.7 并发 drain 与 tracker 时序
+
+Informer cache 对 Pod deletion 的感知存在延迟。没有 tracker 时，短时间内多个节点同时 drain 可能都基于同一份旧 cache 判定为可驱逐，从而同时打掉多个逻辑单元。tracker 的含义是：一旦某个逻辑单元的 eviction 被 allow，在 TTL 内即使 informer cache 里 Pod 仍显示 Ready，该逻辑单元也会被预算计算视为 unavailable。
+
+tracker 使用每个 `ModelServing` 一个 ConfigMap 存储，多个 controller-manager 副本通过 kube-apiserver 共享该状态。每次 allow 前执行 read-modify-write；若 ConfigMap `resourceVersion` 冲突，则重新读取最新 tracker 并重新计算预算。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D1 as "drain node A"
+    participant D2 as "drain node B"
+    participant APIServer as "kube-apiserver"
+    participant WebhookA as "webhook replica A"
+    participant WebhookB as "webhook replica B"
+    participant Cache as "informer cache"
+    participant Tracker as "ConfigMap tracker"
+
+    D1->>APIServer: "evict Pod of group-0"
+    APIServer->>WebhookA: "AdmissionReview group-0"
+    WebhookA->>Cache: "read old Ready state"
+    WebhookA->>Tracker: "GET tracker ConfigMap"
+    WebhookA->>Tracker: "UPDATE tracker with group-0 and resourceVersion"
+    WebhookA-->>APIServer: "allow"
+    APIServer-->>D1: "201 Success"
+
+    D2->>APIServer: "evict Pod of group-1 before cache update"
+    APIServer->>WebhookB: "AdmissionReview group-1"
+    WebhookB->>Cache: "still reads old Ready state"
+    WebhookB->>Tracker: "GET tracker ConfigMap"
+    WebhookB->>WebhookB: "ready budget excludes tracked group-0"
+    alt "budget exhausted"
+        WebhookB-->>APIServer: "deny 429"
+        APIServer-->>D2: "TooManyRequests"
+    else "budget still available"
+        WebhookB->>Tracker: "UPDATE tracker with group-1"
+        WebhookB-->>APIServer: "allow"
+    end
+```
+
+tracker 设计约束：
+
+- tracker 是 Kubernetes ConfigMap 状态，每个 ModelServing 一个 ConfigMap。
+- eviction webhook 开启时 controller-manager 可多副本运行，任意副本都基于共享 ConfigMap 计算预算。
+- ConfigMap 更新使用 `resourceVersion` 冲突重试；冲突后必须重新读取 tracker 并重新计算预算。
+- TTL 默认 60s，可通过 `--eviction-tracker-ttl` 配置。
+- TTL 只覆盖 informer lag，不表示业务恢复时间，也不等待 Pod graceful termination 完成。
+- tracker entry 过期后，预算计算重新完全依赖 informer cache 当前状态。
+
+#### 4.1.8 关键失败和降级路径
+
+| 场景 | 行为 | 设计理由 |
+|-----|------|---------|
+| 集群级开关关闭 | 不渲染 eviction webhook rule | 默认无 admission 性能开销 |
+| webhook rule 残留但 handler 未启用 | allow | 避免配置漂移导致 drain 被误阻塞 |
+| target Pod 缺少 Kthena labels | allow | 非 Kthena Pod 不应受此特性影响 |
+| target ModelServing 不存在 | allow | 避免删除过程中的缓存不一致阻塞清理 |
+| ModelServing 未配置 `evictionStrategy` | allow | 单 workload 显式 opt-in |
+| budget 不足 | deny 429 | 保持 eviction/PDB 重试语义 |
+| controller-manager 重启 | tracker 保留在 ConfigMap 中 | 支持多副本和进程重启后的预算状态延续 |
+
+### 4.2 UI界面设计
+
+不涉及。该特性通过 Kubernetes CRD、Helm values 和 admission webhook 生效，无 Console/UI 变更。
+
+### 4.3 API设计
+
+#### 4.3.1 对外API变更(服务自身API)
+
+新增/变更 Kubernetes CRD 字段：
+
+```go
+type RolloutStrategy struct {
+    EvictionStrategy *EvictionStrategySpec `json:"evictionStrategy,omitempty"`
+}
+
+type EvictionStrategySpec struct {
+    ProtectionLevel ProtectionLevelType `json:"protectionLevel"`
+    MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
+    RoleMinAvailable map[string]intstr.IntOrString `json:"roleMinAvailable,omitempty"`
+}
+```
+
+字段语义：
+
+- `protectionLevel`: `ServingGroup` 或 `Role`。
+- `minAvailable`: ServingGroup 模式阈值；Role 模式下作为未显式配置 role-specific 阈值时的默认阈值。
+- `roleMinAvailable`: Role 模式下 role-specific 阈值，key 必须匹配 `spec.template.roles[*].name`。
+
+新增 admission endpoint：
+
+- URL path：`/validate-eviction`
+- 类型：Kubernetes 内部 admission webhook，不是 OpenAPI。
+- 资源：`apiGroups=[""]`, `resources=["pods/eviction"]`, `operations=["CREATE"]`
+- 返回：
+  - allow：AdmissionResponse `allowed=true`
+  - deny：AdmissionResponse `allowed=false`, status code `429`, message 包含拒绝原因
+
+权限控制：
+
+- 不新增租户 OpenAPI 权限模型。
+- 复用 Kubernetes admission webhook 和 controller-manager ServiceAccount 权限。
+
+流控规模：
+
+- 仅节点 drain 或 eviction 客户端触发。
+- 默认关闭，开启后受 kube-apiserver admission 调用链路影响。
+
+#### 4.3.2 周边API调用变更
+
+| 分析项 | 说明 |
+|-------|------|
+| 依赖API流控规模和服务自身调用场景 | 依赖 Kubernetes API Server admission 调用；handler 主要使用 informer cache，不在正常决策路径调用外部云服务 API |
+| 依赖API在现网上线情况 | 依赖 Kubernetes `pods/eviction` 子资源和 admissionregistration v1 |
+| 依赖API类型 | Kubernetes 内部 API |
+| 内部接口AppCode授权 | 不涉及 |
+| 新增依赖接口字段语义 | 不涉及外部云服务字段 |
+
+### 4.4 数据库设计
+
+不涉及数据库。
+
+#### 4.4.1 数据建模
+
+不涉及数据库 ER 图。ConfigMap tracker 数据结构如下：
+
+```go
+type disruptionTracker map[string]time.Time
+
+type disruptionUnit struct {
+    Namespace string
+    ModelServing string
+    Level string
+    GroupName string
+    Role string
+    RoleID string
+}
+```
+
+ConfigMap 命名：
+
+- namespace：与 `ModelServing` 相同。
+- name：`kthena-eviction-tracker-<modelServingName>`。
+- data key：`entries`，内容为 JSON map，key 为逻辑单元标识，value 为 RFC3339Nano 过期时间。
+
+#### 4.4.2 数据字典与升级方案
+
+不涉及 DB 变更。涉及 CRD schema 升级：
+
+- 新增 `roleMinAvailable` 字段。
+- `minAvailable` 改为 optional，并保持 default 语义。
+- 存量 CRD 需显式升级；Helm `crds/` 目录不会自动升级已存在 CRD。
+
+### 4.5 可观测性设计
+
+#### 4.5.1 指标设计
+
+当前版本不新增 Prometheus 指标。建议后续补充：
+
+- eviction webhook allow 总数，按 namespace/modelServing/protectionLevel 维度。
+- eviction webhook deny 总数，按 namespace/modelServing/protectionLevel/reason 维度。
+- eviction webhook latency。
+- active disruption tracker entries 数量。
+
+#### 4.5.2 日志和事件
+
+当前版本：
+
+- controller-manager 启动日志打印 `enable-eviction-webhook`、`eviction-tracker-ttl`。
+- webhook deny message 返回给 eviction 客户端。
+
+建议后续：
+
+- 对 deny 记录结构化日志，包含 namespace、modelServing、groupName、role、roleID、readyCount、minAvailable。
+- 可选地为 `ModelServing` 记录 warning event，但需避免 drain 高频场景下 event 风暴。
+
+### 4.6 配置项和特性开关设计
+
+| 开关/配置项名称 | 影响行为 | 默认值 | 开启行为 | 关闭行为 | 配置方式 | 周边依赖 | 推荐配置 | 同步清理的组件配置 |
+|--------------|---------------------|--------|---------|---------|---------|---------|---------|---------------------|
+| workload.controllerManager.evictionWebhook.enabled | 控制是否渲染 `pods/eviction` webhook 规则 | false | 安装 eviction validating webhook rule，controller-manager 渲染 1 副本并传入 `--enable-eviction-webhook=true` | 不渲染 eviction webhook rule，`evictionStrategy` 字段不影响 eviction admission | Helm values | Kubernetes admissionregistration v1 | 有节点维护逻辑保护诉求时开启 | 不涉及 |
+| workload.controllerManager.evictionWebhook.failurePolicy | 控制 webhook 调用失败时 kube-apiserver 行为 | Fail | webhook 不可达时拒绝 eviction | 不涉及 | Helm values | kube-apiserver admission | 生产保护场景 Fail；调试可按需调整 | 不涉及 |
+| workload.controllerManager.evictionWebhook.timeoutSeconds | 控制 webhook admission 超时时间 | 5 | 超过配置时间按 failurePolicy 处理 | 不涉及 | Helm values | kube-apiserver admission | 5s | 不涉及 |
+| workload.controllerManager.evictionWebhook.trackerTTLSeconds | 控制 ConfigMap tracker 记录保留时间 | 60 | allow 后逻辑单元在 TTL 内视为 unavailable，用于覆盖 informer lag | TTL 过期后仅依赖 informer 状态 | Helm values / `--eviction-tracker-ttl` | controller-manager、kube-apiserver | 60s | 不涉及 |
+| spec.rolloutStrategy.evictionStrategy | 控制单个 ModelServing 是否启用保护 | unset | 对该 ModelServing 执行 ServingGroup/Role 逻辑预算保护 | webhook 对该 ModelServing 的 Pod eviction 直接 allow | ModelServing CRD | eviction webhook 已启用 | 按业务 SLA 配置 | 不涉及 |
+
+---
+
+## 5. 性能
+
+性能涉及。分析如下：
+
+- 默认关闭集群级 eviction webhook，因此默认无 admission 性能影响。
+- 开启后，kube-apiserver 会对匹配的 `pods/eviction` 请求调用 webhook。
+- handler 使用 informer lister 读取 Pod 和 ModelServing。
+- allow 并消费预算时会对该 ModelServing 的 tracker ConfigMap 执行一次 read-modify-write。
+- tracker 使用 ConfigMap `resourceVersion` 冲突重试保证多副本一致性。
+- 单次预算计算复杂度约为目标 ModelServing Pod 数量 O(n)，额外增加一次 ConfigMap GET/UPDATE。
+- 开启时 controller-manager 可多副本运行；该流量通常来自节点 drain，非高频业务流量。
+
+性能风险：
+
+- 单个 ModelServing Pod 数量极大时，单次 eviction 决策需要遍历该 ModelServing Pod 列表。
+- 大规模并发 drain 同时消费同一个 ModelServing 预算时，会在同一个 tracker ConfigMap 上产生 resourceVersion 冲突和重试。
+
+缓解：
+
+- 默认关闭。
+- 仅配置了 `evictionStrategy` 的 ModelServing 进入预算计算。
+- 每个 ModelServing 一个 tracker ConfigMap，避免所有 workload 共享一个全局热点对象。
+- 后续可增加按 ModelServing/role/group 的索引缓存优化。
+
+---
+
+## 6. 可靠性
+
+### 6.1 故障管理
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 是否涉及外部依赖,外部依赖故障后是否对本特性有影响 | 是，依赖 kube-apiserver admission、controller-manager webhook server |
+| 2 | 故障是否影响系统功能或性能,是否影响用户功能及体验 | 是，开启且 failurePolicy=Fail 时 webhook 不可用会阻塞 eviction |
+| 3 | 故障后是否有监控指标及告警 | 当前不新增，建议后续增加 webhook latency/deny/error 指标 |
+| 4 | 故障后能否自愈,比如健康检查失败后重启,任务失败后可自动恢复等 | 是，controller-manager Pod 由 Deployment 维护 |
+| 5 | 故障发生后是否能实现故障隔离或服务降级 | 是，可通过 Helm 关闭 eviction webhook rule |
+
+详细场景：
+
+- webhook Pod 不可用：eviction 可能被阻塞；关闭 Helm 开关可移除 rule 降级。
+- controller-manager 重启：tracker 保留在 ConfigMap 中，不因进程重启丢失。
+- informer cache lag：通过 TTL tracker 覆盖。
+
+### 6.2 系统防呆
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 是否涉及高危操作,比如删除类操作 | 是，涉及 Pod eviction admission 控制，但不主动删除资源 |
+| 2 | 用户是否能绕过本服务直接操作依赖服务 | 是，直接 DELETE Pod 可绕过 `pods/eviction` webhook |
+
+#### 高危操作影响分析
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 是否有权限控制,防止越权操作 | 是，依赖 Kubernetes RBAC 控制 eviction/delete 权限 |
+| 2 | 用户误操作后是否有恢复手段 | 是，ModelServing controller 可按 recovery policy 重建 Pod |
+| 3 | 误操作后是否有相应的监控指标及告警 | 当前不新增，建议后续补充 |
+
+### 6.3 过载控制
+
+#### 一、开放API接口过载场景分析
+
+| 序号 | 过载场景 | 发生概率 | 处置建议 |
+|-----|---------|---------|---------|
+| 1 | eviction 请求在节点批量 drain 时集中到达 | 中 | 单活 webhook + mutex 串行化；默认关闭；建议限制并发 drain 规模 |
+| 2 | 单个 ModelServing Pod 数量过大导致遍历开销 | 中 | 后续可增加索引或缓存；当前使用 informer lister |
+| 3 | webhook 不可用导致 eviction 堆积 | 中 | 使用 Helm 开关关闭降级；failurePolicy 可按环境配置 |
+| 4 | 非法 CRD 配置导致异常 | 低 | validating webhook 校验 `roleMinAvailable` key 和 int-or-percent 值 |
+
+#### 二、数据面隐藏接口
+
+不涉及。
+
+#### 三、依赖故障
+
+依赖 kube-apiserver admission 和 controller-manager webhook server。故障时通过 Kubernetes rollout、Pod health check、Helm 关闭开关进行恢复或降级。
+
+### 6.4 冗余设计
+
+本版本开启 eviction webhook 时 controller-manager 可多副本运行。多副本下的预算一致性由 ConfigMap tracker 和 `resourceVersion` 冲突重试保证。
+
+### 6.5 资源残留
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 是否涉及用户可见的租户资源 | 是，涉及 ModelServing CRD 字段 |
+| 2 | 是否新增DB记录 | 否 |
+| 3 | 是否涉及软件系统资源 | 是，新增/可选渲染 ValidatingWebhookConfiguration rule |
+
+#### 资源残留影响分析
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 资源残留是否对系统性能、稳定性、可用性或安全性造成影响 | 是，残留 eviction webhook rule 可能继续影响 eviction |
+| 2 | 资源残留是否对用户造成影响 | 是，可能阻塞 drain |
+| 3 | 资源残留后是否有回收策略 | 是，Helm 关闭开关后移除 rule |
+| 4 | 资源残留后是否有监控指标及告警能力 | 当前不新增 |
+
+### 6.6 健康检查
+
+复用 controller-manager webhook server `/healthz`。健康检查只用于 Pod 就绪和存活，不作为业务预算计算依据。
+
+### 6.7 SLI/SLO治理
+
+| 条目 | 能力 | 系统侧风险 | 租户侧风险 | SLI | SLO | 告警 | 能力要求 |
+|-----|------|----------|----------|-----|-----|------|---------|
+| ModelServing eviction protection | 在节点 drain 时保护逻辑服务实例可用性 | webhook 不可用、cache lag、配置错误 | 节点维护时推理容量下降或 drain 被阻塞 | eviction webhook 成功响应率、deny 准确率、latency | 当前不定义正式 SLO，建议后续纳入 webhook admission SLO | 当前不新增 | 支持按 ModelServing/role/group 定位 |
+
+### 6.8 数据可靠性设计
+
+| 序号 | 检查项 | 检查结果:是否涉及 |
+|-----|-------|-----------------|
+| 1 | 是否具备数据备份恢复能力 | 不涉及 |
+| 2 | 是否具备数据软删除的能力 | 不涉及 |
+| 3 | 是否保证了数据完整性和一致性 | 是，ConfigMap tracker 通过 kube-apiserver resourceVersion 冲突重试保证多副本并发一致性 |
+| 4 | 是否对数据操作设计了指标设计和监控 | 当前不新增 |
+
+### 6.9 租户可靠性设计
+
+租户可通过 `evictionStrategy` 提升节点维护期间服务可用性。可靠性边界为 `pods/eviction`，直接 Pod delete 不受保护。
+
+---
+
+## 7. 安全/隐私/韧性
+
+### 7.1 Low Level威胁分析
+
+#### 表一:判断是否需要执行low level威胁分析
+
+| 序号 | 问题 | 是否涉及 | 是否需要执行Low level威胁分析 |
+|-----|------|---------|----------------------------|
+| 1 | 本特性是否属于或涉及认证、鉴权、审计等安全功能相关特性 | 否 | 否 |
+| 2 | 本特性是否属于敏感数据交互的特性 | 否 | 否 |
+| 3 | 本特性是否收集或处理个人数据 | 否 | 否 |
+| 4 | 本特性是否属于业务识别的高风险特性 | 否 | 否 |
+
+#### 表二:如需要执行low level威胁分析,判断是否需要刷新
+
+| 序号 | 问题 | 是否涉及 |
+|-----|------|---------|
+| 1 | 有无新增外部实体 | 否 |
+| 2 | 有无新增与信任边界外交互的接口 | 否 |
+| 3 | 有无新增组件 | 否 |
+| 4 | 有无新增与信任边界外交互的数据流 | 否 |
+| 5 | 原有数据流中有无新增敏感或个人数据 | 否 |
+| 6 | 原有数据存储有无新增敏感和个人数据 | 否 |
+
+### 7.2 安全/隐私/韧性设计
+
+#### 7.2.1 安全隔离设计
+
+设计内容：
+
+- 账号隔离：不新增账号，复用 controller-manager ServiceAccount。
+- 网络隔离：复用现有 webhook Service 和 TLS 证书机制。
+- 运行时隔离：运行在 controller-manager Pod 内。
+- 安全加固：默认关闭；failurePolicy、timeout 可配置。
+
+输出件：
+
+| 序号 | 交付件 | 本特性是否涉及刷新 | 交付件链接 |
+|-----|-------|-----------------|----------|
+| 1 | 通信矩阵 | 否 | 不涉及新增端口 |
+| 2 | 进程信息 | 否 | 复用 controller-manager |
+
+#### 7.2.2 认证与权限设计
+
+- 是否有新增API：新增 Kubernetes admission webhook path，不是租户 OpenAPI。
+- 是否有新增账号：否。
+- 账号权限最小化：复用现有 controller-manager 权限；handler 使用 informer cache。
+
+账号清单：不涉及新增账号。
+
+#### 7.2.3 日志安全
+
+- 不新增日志文件。
+- deny message 不包含敏感信息，仅包含 namespace/name 级 Kubernetes 资源标识和计数。
+- 日志转储机制复用 controller-manager。
+
+### 7.3 数据安全设计
+
+#### 7.3.1 数据安全风险识别
+
+| 序号 | 检查项 | 说明 |
+|-----|-------|------|
+| 1 | 是否有新增OBS桶 | 否 |
+| 2 | 如特性有新增业务数据 | 否 |
+| 3 | 重要数据与核心数据清单 | 不涉及 |
+
+#### 7.3.2 数据保护设计
+
+不涉及新增业务数据采集、存储、共享或销毁。
+
+#### 7.3.3 密钥管理
+
+不涉及新增密钥。
+
+#### 7.3.4 证书生命周期管理
+
+| 序号 | 检查项 | 要求 |
+|-----|-------|------|
+| 1 | 不允许在软件包中预置证书 | 复用现有 webhook 证书机制 |
+| 2 | 必须要支持证书更新能力 | 复用现有 cert-manager/auto/manual 证书模式 |
+| 3 | 证书的私钥要加密保护 | 复用 Kubernetes Secret |
+
+### 7.4 隐私保护设计
+
+#### 7.4.1 隐私PIA分析
+
+不涉及新增个人数据，不需要刷新 PIA。
+
+#### 7.4.2 隐私保护方案设计
+
+不涉及。
+
+---
+
+## 8. 生产就绪
+
+### 8.1 升级和回退
+
+#### 8.1.1 特性开关及白名单
+
+- [ ] 不涉及特性开关及白名单
+- [x] 涉及特性开关或白名单
+
+特性开关必须满足条件：
+
+| 序号 | 条目 | 是否满足 |
+|-----|------|---------|
+| 1 | TMG评审通过 | 不涉及当前开源开发流程 |
+| 2 | 如多组件共用特性开关需明确升级顺序且评审通过 | 不涉及，多组件不共用 |
+
+特性开关注意事项：
+
+| 序号 | 条目 | 是否涉及 |
+|-----|------|---------|
+| 1 | 是否需要重启进程 | 是，Helm upgrade 会滚动 controller-manager |
+| 2 | 是否需要重启其他组件 | 否 |
+| 3 | 是否需要重启/重建节点 | 否 |
+| 4 | 是否有集群版本要求 | 是，需支持 admissionregistration v1 和 policy/v1 eviction |
+
+#### 8.1.2 特性开启影响
+
+| 序号 | 条目 | 是否涉及 |
+|-----|------|---------|
+| 1 | 是否改变默认行为 | 否，默认关闭 |
+| 2 | 是否存在API/API字段或配置参数变化 | 是，新增 CRD 字段、Helm values、controller-manager flags |
+| 3 | 是否涉及DB字段变化 | 否 |
+| 4 | 是否影响管理面功能 | 是，controller-manager webhook admission 路径扩展 |
+| 5 | 是否影响存量集群功能 | 默认不影响；开启后影响 `pods/eviction` |
+
+#### 8.1.3 特性回退注意事项
+
+| 序号 | 条目 | 是否涉及 |
+|-----|------|---------|
+| 1 | 特性应具备回退能力 | 是，关闭 Helm 开关移除 webhook rule |
+| 2 | 是否涉及指标 | 当前否 |
+| 3 | 回退是否可能失败 | 低，取决于 Helm/kube-apiserver 可用性 |
+| 4 | 是否涉及API/API字段、配置参数变化 | 是，CRD 字段保留不影响关闭 |
+| 5 | 是否涉及DB字段变化 | 否 |
+| 6 | 如已有用户/集群使用此特性 | 关闭后不再保护 eviction |
+| 7 | 特性是否与集群版本相关 | 是 |
+
+#### 8.1.4 升级-> 回退 -> 再升级
+
+| 序号 | 条目 | 是否涉及 |
+|-----|------|---------|
+| 1 | 特性回滚后再升级是否有影响 | 否，CRD 字段可保留，Helm 开关控制行为 |
+| 2 | 特性是否与集群版本相关 | 是 |
+
+#### 8.1.5 特性对升级的影响
+
+| 序号 | 条目 | 是否涉及 |
+|-----|------|---------|
+| 1 | 是否影响老版本集群升级 | 默认关闭，不影响；CRD schema 需升级 |
+| 2 | 集群升级后是否影响历史业务 | 默认不影响 |
+| 3 | 集群升级后特性开放策略 | 默认关闭，按需开启 |
+| 4 | 是否新增数据面组件 | 否 |
+| 5 | 是否涉及集群内CRD的变更 | 是，ModelServing CRD |
+
+### 8.2 HCS 兼容性
+
+| HCS 关注项 | 若涉及,请更新 | 是否涉及 |
+|-----------|-------------|---------|
+| 特性开关 | 已补充 4.6 | 是 |
+| 依赖API变化 | 已补充 4.3.2 | 是 |
+| 数据库变更 | 不涉及 | 否 |
+| 操作系统 | 不涉及特定 OS | 否 |
+
+#### 8.2.1 操作系统依赖
+
+| OS交互详情 | OS依赖 | OS变更 | 已经验证的OS |
+|----------|-------|-------|------------|
+| controller-manager 运行于 Kubernetes Pod | 容器运行时和 Kubernetes 节点正常运行 | 不涉及 | Kind 节点 Debian GNU/Linux 12 |
+
+### 8.3 日志、监控与告警
+
+当前版本不新增告警。生产建议：
+
+- 增加 webhook allow/deny/error/latency 指标。
+- 增加 controller-manager webhook server 可用性告警。
+- 增加 eviction deny 日志定界字段。
+
+---
+
+## 9. 资料
+
+### 9.1 需求是否涉及资料修改
+
+涉及资料修改。原因：新增 CRD 字段、Helm values 和运维使用方式。
+
+#### 9.1.1 客户侧资料
+
+| 资料名称 | 涉及资料修改的情况说明 | 是否修改资料(Y/N/不涉及) | 刷新责任人 |
+|---------|---------------------|---------------------|----------|
+| 成长地图 | 不涉及 | 不涉及 | 不涉及 |
+| 功能总览 | 可选，若作为发布特性需补充 | Y | Kthena 文档维护者 |
+| 介绍视频 | 不涉及 | 不涉及 | 不涉及 |
+| 最新动态 | 可选，发布时补充 | Y | Kthena 文档维护者 |
+| 产品介绍 | 需说明 eviction protection 场景和约束 | Y | Kthena 文档维护者 |
+| 服务公告 | 不涉及下线，发布时可选 | 不涉及 | 不涉及 |
+| 操作视频 | 不涉及 Console 操作 | 不涉及 | 不涉及 |
+| 快速入门 | 可增加 ModelServing evictionStrategy 示例 | Y | Kthena 文档维护者 |
+| Kubernetes基础知识 | 不涉及 | 不涉及 | 不涉及 |
+| 用户指南 | 需补充 ServingGroup/Role 保护配置 | Y | Kthena 文档维护者 |
+| 界面信息(帮助面板、抽屉帮助) | 不涉及 UI | 不涉及 | 不涉及 |
+| 常见问题 | 建议补充 drain 被 429 拒绝原因 | Y | Kthena 文档维护者 |
+| 最佳实践 | 建议补充节点维护最佳实践 | Y | Kthena 文档维护者 |
+| 计费说明 | 不涉及计费 | 不涉及 | 不涉及 |
+| API参考 | 需补充 CRD 字段 | Y | Kthena 文档维护者 |
+| SDK参考 | client-go applyconfiguration 已生成字段 | Y | Kthena 文档维护者 |
+
+#### 9.1.2 运维侧资料
+
+| 资料名称 | 涉及资料修改的情况说明 | 是否修改资料(Y/N/不涉及) | 刷新责任人 |
+|---------|---------------------|---------------------|----------|
+| 版本说明书 | 发布时需说明新增特性 | Y | Kthena 文档维护者 |
+| 升级指南 | 需说明 CRD replace/apply 注意事项 | Y | Kthena 文档维护者 |
+| 安装指南 | 需说明 Helm evictionWebhook 开关 | Y | Kthena 文档维护者 |
+| 通信矩阵 | 不新增端口 | 不涉及 | 不涉及 |
+| 账户一览表 | 不新增账号 | 不涉及 | 不涉及 |
+| 证书一览表 | 复用 webhook 证书 | 不涉及 | 不涉及 |
+| 维护指南 > 安全管理指南 | 不涉及 | 不涉及 | 不涉及 |
+| 维护指南 > 高危操作 | 可说明 drain/eviction 保护影响 | Y | Kthena 文档维护者 |
+| 维护指南 > 监控指南 | 当前不新增指标，后续如加指标需刷新 | 不涉及 | 不涉及 |
+| 备份与恢复指南 | 不涉及 | 不涉及 | 不涉及 |
+| 配置管理指南 | 需说明 Helm values | Y | Kthena 文档维护者 |
+| 配额调整指南 | 不涉及 | 不涉及 | 不涉及 |
+| 命令参考 | 可补充 `kubectl create --raw .../eviction` 验证方法 | Y | Kthena 文档维护者 |
+| 日志参考 | 可补充 deny 日志/返回原因 | Y | Kthena 文档维护者 |
+| 告警处理 | 当前不新增告警 | 不涉及 | 不涉及 |
+| 故障处理(同应急预案) | 需说明关闭 eviction webhook 降级方法 | Y | Kthena 文档维护者 |
+
+### 9.2 资料模块X设计
+
+#### 9.2.1 基本概念
+
+- `ServingGroup`：Kthena 中完成一次推理服务能力的逻辑组。
+- `Role`：ServingGroup 内承担特定职责的角色，如 `prefill`、`decode`。
+- `role-id`：同一 role 的逻辑实例标识，一个 role instance 可包含 entry/worker 多个 Pod。
+- `evictionStrategy`：ModelServing 节点驱逐保护策略。
+- `roleMinAvailable`：Role 模式下 role-specific 最小可用逻辑实例数。
+
+#### 9.2.2 功能原理
+
+节点 drain 发起 `pods/eviction` 请求，kube-apiserver 调用 Kthena eviction webhook。webhook 基于 Pod label 找到 ModelServing 并统计逻辑单元可用性。如果驱逐会导致可用逻辑单元数小于或等于阈值，则拒绝，客户端退避重试。
+
+#### 9.2.3 计费说明
+
+不涉及计费。
+
+---
+
+## 10. 测试建议
+
+基本功能：
+
+- 默认 Helm values 下不渲染 `eviction.modelserving.volcano.sh`。
+- 开启 `workload.controllerManager.evictionWebhook.enabled=true` 后渲染 webhook rule。
+- 开启后 controller-manager 保持用户配置的 `replicas`，不被 eviction webhook 强制改为 1。
+- `roleMinAvailable` unknown key 被 ModelServing validating webhook 拒绝。
+- `roleMinAvailable` 非法百分比被拒绝。
+- ServingGroup 模式：第一个 Ready group eviction allow，预算达到阈值后第二个 group eviction deny。
+- Role 模式：同一 role-id 的 entry/worker eviction allow，另一个 role-id 在预算不足时 deny。
+
+异常场景：
+
+- webhook handler 关闭但 rule 残留时，应 allow，避免误阻塞 drain。
+- target Pod 缺少 Kthena label 时 allow。
+- target ModelServing 不存在或未配置 `evictionStrategy` 时 allow。
+
+可靠性：
+
+- 使用两个 webhook handler 实例短时间连续发多个不同 group/role-id eviction，验证 ConfigMap tracker 跨副本生效。
+- tracker TTL 过期后，若 informer 状态仍未变化，预算按当前状态重新计算。
+- controller-manager 重启后确认服务可恢复，记录 failover 窗口风险。
+
+运维：
+
+- Helm 开启、关闭 eviction webhook 后检查 `ValidatingWebhookConfiguration`。
+- Kind 集群中用 `kubectl create --raw /api/v1/namespaces/<ns>/pods/<pod>/eviction -f <payload.json>` 进行真实 eviction 验证。
+
+性能：
+
+- 对包含大量 Pod 的 ModelServing 执行 eviction 压测，观察 webhook latency。
+
+安全：
+
+- 验证 RBAC：无 eviction 权限用户无法发起 eviction。
+- 验证返回信息不包含敏感信息。
+
+---
+
+## 11. 需求分解
+
+### 11.1 US/Task分解及工作量
+
+| US编号 | US描述 | 工作量(人天,含开发者自测) |
+|-------|-------|----------------------|
+| US006-1 | 定义 ModelServing evictionStrategy API，支持 ServingGroup/Role 两种 protectionLevel | 1 |
+| US006-2 | 实现 ServingGroup 级 eviction webhook 保护，按 `group-name` 逻辑单元消费预算 | 1.5 |
+| US006-3 | 实现 Role 级 eviction webhook 保护，按 `role + role-id` 逻辑实例消费预算 | 1.5 |
+| US006-4 | 实现 `roleMinAvailable`，支持不同 role 使用不同最小可用阈值 | 1 |
+| US006-5 | 实现 ConfigMap-backed logical-unit tracker，处理 informer cache lag、短时间多节点 drain 和 webhook 多副本并发 | 1.5 |
+| US006-6 | 增加 ModelServing validating webhook 校验 `roleMinAvailable` key 和 int-or-percent 值 | 0.5 |
+| US006-7 | 增加 Helm 集群级开关、tracker TTL 参数，并保持 controller-manager 多副本能力 | 1 |
+| US006-8 | 补充单测、Helm template 验证、Kind 真实验证材料 | 1.5 |
+
+### 11.2 外部需求清单
+
+| 需求单号 | 需求描述 | 依赖服务 |
+|---------|---------|---------|
+| 不涉及 | 不涉及外部云服务需求 | 不涉及 |
+
+--- 

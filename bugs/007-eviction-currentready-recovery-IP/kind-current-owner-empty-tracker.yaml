@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kthena-eviction-tracker-evict-currentready
+  namespace: eviction-007-currentready
+  labels:
+    modelserving.volcano.sh/name: evict-currentready
+  ownerReferences:
+  - apiVersion: workload.serving.volcano.sh/v1alpha1
+    kind: ModelServing
+    name: evict-currentready
+    uid: f2f3b141-4892-40e2-a289-591f90f18336
+data:
+  entries: '{}'

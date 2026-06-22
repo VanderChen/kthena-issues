@@ -1,0 +1,19 @@
+[
+  {
+    "op": "replace",
+    "path": "/metadata/ownerReferences",
+    "value": [
+      {
+        "apiVersion": "workload.serving.volcano.sh/v1alpha1",
+        "kind": "ModelServing",
+        "name": "evict-currentready",
+        "uid": "00000000-0000-0000-0000-000000000007"
+      }
+    ]
+  },
+  {
+    "op": "replace",
+    "path": "/data/entries",
+    "value": "{\"ServingGroup/eviction-007-currentready/evict-currentready/evict-currentready-0\":{\"expiresAt\":\"2030-01-01T00:00:00Z\",\"triggerPodUID\":\"old-same-name-trigger-uid\",\"triggerPodName\":\"old-same-name-notready\"}}"
+  }
+]

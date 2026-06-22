@@ -1,0 +1,5 @@
+{
+  "data": {
+    "entries": "{\"ServingGroup/eviction-007-currentready/evict-currentready/evict-currentready-0\":{\"expiresAt\":\"2026-06-17T10:30:00Z\",\"triggerPodUID\":\"old-prefill-uid\",\"triggerPodName\":\"evict-currentready-0-prefill-0-0\"}}"
+  }
+}

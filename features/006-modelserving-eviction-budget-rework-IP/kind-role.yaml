@@ -1,0 +1,34 @@
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: evict-role
+  namespace: eviction-006
+spec:
+  replicas: 1
+  schedulerName: volcano
+  recoveryPolicy: None
+  rolloutStrategy:
+    evictionStrategy:
+      protectionLevel: Role
+      minAvailable: 0
+      roleMinAvailable:
+        decode: 1
+  template:
+    roles:
+    - name: decode
+      replicas: 2
+      workerReplicas: 1
+      entryTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]
+      workerTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]

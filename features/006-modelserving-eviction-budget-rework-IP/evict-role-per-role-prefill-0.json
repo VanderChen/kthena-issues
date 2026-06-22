@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "evict-role-per-role-minavailable-0-prefill-0-0",
+    "namespace": "eviction-006-role-per-role-minavailable"
+  }
+}

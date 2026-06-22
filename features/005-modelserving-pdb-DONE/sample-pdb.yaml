@@ -1,0 +1,38 @@
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: vllm-sample
+spec:
+  replicas: 3
+  podDisruptionBudget:
+    maxUnavailable: 1
+  template:
+    roles:
+    - name: prefill
+      replicas: 1
+      entryTemplate:
+        spec:
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                modelserving.volcano.sh/name: vllm-sample
+          containers:
+          - name: vllm
+            image: vllm/vllm-openai
+    - name: decode
+      replicas: 2
+      entryTemplate:
+        spec:
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                modelserving.volcano.sh/name: vllm-sample
+          containers:
+          - name: vllm
+            image: vllm/vllm-openai

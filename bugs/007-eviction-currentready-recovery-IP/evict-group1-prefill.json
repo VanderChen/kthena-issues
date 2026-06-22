@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "evict-currentready-1-prefill-0-0",
+    "namespace": "eviction-007-currentready"
+  }
+}

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: repro-sample-0-predictor-0-0
+  namespace: default
+  labels:
+    modelserving.volcano.sh/entry: "true"
+    modelserving.volcano.sh/group-name: repro-sample-0
+    modelserving.volcano.sh/name: repro-sample
+    modelserving.volcano.sh/revision: manual-test
+    modelserving.volcano.sh/role: predictor
+    modelserving.volcano.sh/role-id: predictor-0
+spec:
+  containers:
+  - name: leader
+    image: nginx:alpine

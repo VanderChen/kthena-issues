@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orphan-same-name-notready
+  namespace: eviction-007-currentready
+  labels:
+    modelserving.volcano.sh/entry: "true"
+    modelserving.volcano.sh/group-name: evict-currentready-0
+    modelserving.volcano.sh/name: evict-currentready
+    modelserving.volcano.sh/revision: orphan-revision
+    modelserving.volcano.sh/role: prefill
+    modelserving.volcano.sh/role-id: prefill-0
+    modelserving.volcano.sh/role-template-hash: orphan-template
+spec:
+  restartPolicy: Never
+  containers:
+  - name: main
+    image: busybox:not-a-real-tag
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]

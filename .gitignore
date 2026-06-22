@@ -1,0 +1,20 @@
+.DS_Store
+
+# Local editor and OS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated logs and large transient outputs
+*.log
+*.tmp
+*.out
+
+# Local benchmark scratch files. Keep curated results under results/.
+scratch/
+tmp/
+
+# Kubernetes client output that may contain environment-specific details.
+kubeconfig*
+*.kubeconfig

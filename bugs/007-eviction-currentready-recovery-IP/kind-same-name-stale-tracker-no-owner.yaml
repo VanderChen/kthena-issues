@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kthena-eviction-tracker-evict-currentready
+  namespace: eviction-007-currentready
+  labels:
+    modelserving.volcano.sh/name: evict-currentready
+data:
+  entries: '{"ServingGroup/eviction-007-currentready/evict-currentready/evict-currentready-0":{"expiresAt":"2030-01-01T00:00:00Z","triggerPodUID":"old-same-name-trigger-uid","triggerPodName":"old-same-name-notready"}}'

@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "vllm-pdb-test-0-worker-0-0",
+    "namespace": "default"
+  }
+}
