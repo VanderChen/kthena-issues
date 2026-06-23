@@ -1,0 +1,21 @@
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: evict-validation-role-missing-min
+spec:
+  replicas: 3
+  schedulerName: volcano
+  rolloutStrategy:
+    type: ServingGroupRollingUpdate
+    evictionStrategy:
+      protectionLevel: Role
+  template:
+    roles:
+    - name: decode
+      replicas: 2
+      entryTemplate:
+        spec:
+          containers:
+          - name: decode
+            image: nginx:1.25
+      workerReplicas: 0
