@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "evict-role-currentready-0-decode-2-0",
+    "namespace": "eviction-009-role-currentready"
+  }
+}

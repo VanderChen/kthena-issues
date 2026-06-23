@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "role-cache-incomplete-0-decode-1-0",
+    "namespace": "eviction-009-role-cache-incomplete"
+  }
+}

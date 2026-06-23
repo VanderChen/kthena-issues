@@ -1,0 +1,7 @@
+[
+  {
+    "op": "replace",
+    "path": "/data/entries",
+    "value": "{\"Role/eviction-009-role-currentready/evict-role-currentready/evict-role-currentready-0/decode/decode-1\":{\"expiresAt\":\"2030-01-01T00:00:00Z\",\"triggerPodUID\":\"old-role-trigger-uid\",\"triggerPodName\":\"old-decode-1\"}}"
+  }
+]

@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: eviction-009-role-cache-incomplete
+---
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: role-cache-incomplete
+  namespace: eviction-009-role-cache-incomplete
+spec:
+  replicas: 0
+  schedulerName: volcano
+  recoveryPolicy: RoleRecreate
+  rolloutStrategy:
+    evictionStrategy:
+      protectionLevel: Role
+      roleMinAvailable:
+        decode: 1
+        prefill: 1
+  template:
+    roles:
+    - name: prefill
+      replicas: 2
+      workerReplicas: 1
+      entryTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]
+      workerTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]
+    - name: decode
+      replicas: 3
+      workerReplicas: 2
+      entryTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]
+      workerTemplate:
+        spec:
+          containers:
+          - name: main
+            image: busybox
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c", "sleep 3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: role-cache-incomplete-0-decode-0-0
+  namespace: eviction-009-role-cache-incomplete
+  labels:
+    modelserving.volcano.sh/group-name: role-cache-incomplete-0
+    modelserving.volcano.sh/role: decode
+    modelserving.volcano.sh/role-id: decode-0
+spec:
+  containers:
+  - name: main
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: role-cache-incomplete-0-decode-1-0
+  namespace: eviction-009-role-cache-incomplete
+  labels:
+    modelserving.volcano.sh/name: role-cache-incomplete
+    modelserving.volcano.sh/group-name: role-cache-incomplete-0
+    modelserving.volcano.sh/role: decode
+    modelserving.volcano.sh/role-id: decode-1
+spec:
+  containers:
+  - name: main
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: role-cache-incomplete-0-decode-2-0
+  namespace: eviction-009-role-cache-incomplete
+  labels:
+    modelserving.volcano.sh/group-name: role-cache-incomplete-0
+    modelserving.volcano.sh/role: decode
+    modelserving.volcano.sh/role-id: decode-2
+spec:
+  containers:
+  - name: main
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
