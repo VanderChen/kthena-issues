@@ -1,0 +1,8 @@
+{
+  "apiVersion": "policy/v1",
+  "kind": "Eviction",
+  "metadata": {
+    "name": "evict-sg-other-notready-0-prefill-0-0",
+    "namespace": "eviction-011-notready-target"
+  }
+}
