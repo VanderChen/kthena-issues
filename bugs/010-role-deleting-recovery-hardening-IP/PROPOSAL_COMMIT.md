@@ -373,3 +373,44 @@ Cleanup:
 ```bash
 kubectl delete namespace kthena-e2e-010 --wait=true --timeout=120s
 ```
+
+## Follow-up: Periodic Global Reconcile
+
+Date: 2026-06-24
+
+Additional field signal: long-running stability tests that repeatedly scale
+ModelServing replicas up and down can also occasionally leave a Pod missing.
+Restarting the controller-manager fixes the state because startup runs
+`syncAll()`, which reprocesses cached child Pods and enqueues every
+ModelServing.
+
+Code commit:
+
+```text
+016aa89b fix model serving periodic recovery sync
+```
+
+The controller previously only ran this global cache-based check once at
+startup. Informer resync periods are set to `0`, so a missed or dropped event
+chain during repeated scaling had no periodic self-healing path.
+
+Added a low-frequency periodic full sync:
+
+- default period: `5m`;
+- data source: local informer cache via existing listers;
+- behavior: reprocess cached Pods and enqueue all ModelServings, matching
+  startup `syncAll()`;
+- apiserver pressure: no periodic live list calls are introduced. The apiserver
+  is only touched by normal reconcile work for objects that actually need
+  correction.
+
+Additional test:
+
+- `TestPeriodicFullSyncRequeuesModelServing`
+
+Verification:
+
+```bash
+go test ./pkg/model-serving-controller/controller -run 'TestPeriodicFullSyncRequeuesModelServing|TestManageRoleReplicasRoleRecreateMissingPodsDeletesRole|TestManageRoleReplicasRoleRecreateCreatingRoleCompletesPods|TestReconcileDeletingRoleUsesLiveCheckWhenInformerIsStale' -count=1 -v
+go test ./pkg/model-serving-controller/...
+```
