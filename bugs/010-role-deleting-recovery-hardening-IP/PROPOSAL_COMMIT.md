@@ -414,3 +414,125 @@ Verification:
 go test ./pkg/model-serving-controller/controller -run 'TestPeriodicFullSyncRequeuesModelServing|TestManageRoleReplicasRoleRecreateMissingPodsDeletesRole|TestManageRoleReplicasRoleRecreateCreatingRoleCompletesPods|TestReconcileDeletingRoleUsesLiveCheckWhenInformerIsStale' -count=1 -v
 go test ./pkg/model-serving-controller/...
 ```
+
+## Kind Verification After Periodic Sync Follow-up
+
+Date: 2026-06-25
+
+Verified commit:
+
+```text
+016aa89b fix model serving periodic recovery sync
+```
+
+Kind node architecture:
+
+```text
+arm64
+```
+
+Built and loaded image:
+
+```bash
+GOOS=linux GOARCH=arm64 go build \
+  -o /Users/vanderchen/workspace/dev/kthena-workspace/local-output/kthena-controller-manager-010-periodic-016aa89b \
+  ./cmd/kthena-controller-manager/main.go
+
+docker build -t kthena-controller-manager:dev-010-periodic-016aa89b \
+  -f Dockerfile.local \
+  --build-arg BINARY_DIR=local-output \
+  --build-arg BINARY_NAME=kthena-controller-manager-010-periodic-016aa89b .
+
+kind load docker-image kthena-controller-manager:dev-010-periodic-016aa89b --name kind
+```
+
+Helm upgrade hit an existing local field-manager conflict on
+`Deployment.spec.replicas` owned by `kubectl scale`, so the verification image
+was applied with `kubectl set image`. The current local chart args also include
+newer flags that this branch does not contain, so the verification deployment
+was temporarily run with compatible args:
+
+```text
+--v=4
+--cert-secret-name=kthena-controller-manager-webhook-certs
+--service-name=kthena-controller-manager-webhook
+```
+
+Controller-manager rollout completed with image:
+
+```text
+kthena-controller-manager:dev-010-periodic-016aa89b
+```
+
+Applied the RoleRecreate verification workload:
+
+```text
+issues/bugs/010-role-deleting-recovery-hardening-IP/kind-role-recreate-e2e.yaml
+```
+
+Initial Pod UIDs:
+
+```text
+role-recreate-e2e-010-0-prefill-0-0   c6ea89c4-dd2b-4c52-8981-afd5ffecc723
+role-recreate-e2e-010-0-prefill-0-1   ec3e89dd-ba70-471d-b7b0-edb67b87e50e
+```
+
+Action:
+
+```bash
+kubectl delete pod role-recreate-e2e-010-0-prefill-0-1 -n kthena-e2e-010 --wait=false
+```
+
+Recovered Pod UIDs:
+
+```text
+role-recreate-e2e-010-0-prefill-0-0   6add149d-b220-463c-9628-cd072c320285
+role-recreate-e2e-010-0-prefill-0-1   146f157c-b0b7-4dac-a679-bf39dc9f003b
+```
+
+The entry and worker Pods were both recreated, confirming Role-level recovery.
+
+Final ModelServing status:
+
+```text
+availableReplicas: 1
+currentReplicas: 1
+updatedReplicas: 1
+Available=True
+```
+
+Controller log evidence for RoleRecreate recovery:
+
+```text
+Role prefill/prefill-0 in ServingGroup role-recreate-e2e-010-0 is now Deleting
+role prefill-0 of servingGroup role-recreate-e2e-010-0 has been deleted
+manageRoleReplicas: scaling UP role prefill in ServingGroup role-recreate-e2e-010-0: current=0, expected=1
+Role prefill/prefill-0 in ServingGroup role-recreate-e2e-010-0 is now Creating
+Role prefill/prefill-0 in ServingGroup role-recreate-e2e-010-0 is now Running
+```
+
+Periodic full sync evidence after waiting one default 5-minute interval with
+`--v=4`:
+
+```text
+02:36:57 model_serving_controller.go:647] running periodic ModelServing full sync
+02:36:57 model_serving_controller.go:262] "Adding" modelServing="kthena-e2e-010/role-recreate-e2e-010"
+02:36:57 model_serving_controller.go:562] "Started syncing ModelServing" key="kthena-e2e-010/role-recreate-e2e-010"
+```
+
+Cleanup and restore:
+
+```bash
+kubectl delete namespace kthena-e2e-010 --wait=true --timeout=180s
+kubectl set image deploy/kthena-controller-manager -n kthena-system \
+  kthena-controller-manager=kthena-controller-manager:dev-012
+kubectl patch deploy kthena-controller-manager -n kthena-system --type=json ...
+kubectl rollout status deploy/kthena-controller-manager -n kthena-system --timeout=180s
+```
+
+The Kind cluster was restored to the pre-verification image and args:
+
+```text
+kthena-controller-manager:dev-012
+["--v=2","--enable-eviction-webhook=true","--eviction-tracker-ttl=60s","--cert-secret-name=kthena-controller-manager-webhook-certs","--service-name=kthena-controller-manager-webhook"]
+```
