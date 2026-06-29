@@ -536,3 +536,124 @@ The Kind cluster was restored to the pre-verification image and args:
 kthena-controller-manager:dev-012
 ["--v=2","--enable-eviction-webhook=true","--eviction-tracker-ttl=60s","--cert-secret-name=kthena-controller-manager-webhook-certs","--service-name=kthena-controller-manager-webhook"]
 ```
+
+## Follow-up: Repeated Scale Leaves Stale Deleting ServingGroups
+
+Date: 2026-06-29
+
+Additional field signal: during a long-running repeated scale test, the
+ModelServing spec was `replicas: 4`, but only one ServingGroup was present:
+
+```text
+running periodic ModelServing full sync
+updatePod: ns-myq/modelserving-test-7-prefill-0-0, Running
+updatePod: ns-myq/modelserving-test-7-prefill-0-1, Running
+"Adding" modelServing="ns-myq/modelserving-test"
+"Started syncing ModelServing" key="ns-myq/modelserving-test"
+No ServingGroups can be updated for ModelServing ns-myq/modelserving-test: maxScaleDown=-2
+```
+
+The important difference from the earlier issue is that periodic full sync did
+fire and did enqueue the ModelServing. The failure was in replica accounting:
+the in-memory store can retain stale `ServingGroupDeleting` entries after
+repeated scale operations. Those stale entries count toward `curReplicas`, so
+`manageServingGroupReplicas` does not enter scale-up even though only one live
+ServingGroup remains.
+
+Code commit:
+
+```text
+48559b8e fix model serving pruning stale deleting groups
+```
+
+Implemented hardening:
+
+- before calculating `curReplicas`, `manageServingGroupReplicas` now prunes
+  `ServingGroupDeleting` records whose owned Pods, Services, and PodGroups are
+  already gone;
+- `isServingGroupDeleted` now filters resources by the current ModelServing UID,
+  matching the Role-level same-name protection;
+- added regression coverage for the field shape: spec replicas `4`, stale
+  deleting groups `4/5/6`, one running group `7`; reconcile removes the stale
+  groups and creates groups `8/9/10` so the store returns to four replicas.
+
+Verification:
+
+```bash
+go test ./pkg/model-serving-controller/controller -run 'TestManageServingGroupReplicasPrunesDeletedGroupsBeforeScaleUp|TestDeletePodParentListerMissDoesNotRequeueByLabelOnly|TestPeriodicFullSyncRequeuesModelServing|TestManageRoleReplicas$|TestReconcileDeletingRoleIgnoresStaleSameNamedPodFromOldModelServing|TestIsServingGroupDeleted|TestIsRoleDeleted' -count=1 -v
+go test ./pkg/model-serving-controller/...
+```
+
+## Kind Scale-loop Verification
+
+Date: 2026-06-29
+
+Built and deployed controller-manager image from commit `48559b8e`:
+
+```text
+kthena-controller-manager:dev-010-prune-sg
+```
+
+Applied scale-loop workload:
+
+```text
+issues/bugs/010-role-deleting-recovery-hardening-IP/kind-scale-loop-e2e.yaml
+```
+
+Verification sequence:
+
+```bash
+kubectl patch modelserving scale-loop-e2e-010 -n kthena-e2e-010-scale --type=merge -p '{"spec":{"replicas":4}}'
+kubectl patch modelserving scale-loop-e2e-010 -n kthena-e2e-010-scale --type=merge -p '{"spec":{"replicas":1}}'
+kubectl patch modelserving scale-loop-e2e-010 -n kthena-e2e-010-scale --type=merge -p '{"spec":{"replicas":4}}'
+kubectl patch modelserving scale-loop-e2e-010 -n kthena-e2e-010-scale --type=merge -p '{"spec":{"replicas":1}}'
+kubectl patch modelserving scale-loop-e2e-010 -n kthena-e2e-010-scale --type=merge -p '{"spec":{"replicas":4}}'
+```
+
+Final Pod count:
+
+```text
+8
+```
+
+Final ServingGroup distribution:
+
+```text
+scale-loop-e2e-010-0
+scale-loop-e2e-010-0
+scale-loop-e2e-010-1
+scale-loop-e2e-010-1
+scale-loop-e2e-010-2
+scale-loop-e2e-010-2
+scale-loop-e2e-010-3
+scale-loop-e2e-010-3
+```
+
+Final ModelServing status:
+
+```text
+spec.replicas: 4
+status.replicas: 4
+status.availableReplicas: 4
+status.currentReplicas: 4
+status.updatedReplicas: 4
+Available=True
+```
+
+Cleanup and restore:
+
+```bash
+kubectl delete namespace kthena-e2e-010-scale --wait=true --timeout=180s
+kubectl set image deploy/kthena-controller-manager -n kthena-system \
+  kthena-controller-manager=kthena-controller-manager:dev-012
+kubectl patch deploy kthena-controller-manager -n kthena-system --type=json ...
+kubectl rollout status deploy/kthena-controller-manager -n kthena-system --timeout=180s
+```
+
+The Kind cluster was restored to:
+
+```text
+kthena-controller-manager:dev-012
+["--v=2","--enable-eviction-webhook=true","--eviction-tracker-ttl=60s","--cert-secret-name=kthena-controller-manager-webhook-certs","--service-name=kthena-controller-manager-webhook"]
+readyReplicas: 2
+```
