@@ -1,0 +1,77 @@
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: x-p-y-d-topology-example
+  namespace: default
+spec:
+  # Each replica is one ServingGroup and produces one Volcano PodGroup.
+  replicas: 3
+  schedulerName: volcano
+  recoveryPolicy: RoleRecreate
+  template:
+    # networkTopology defines aggregation/envelopes.
+    networkTopology:
+      # Keep every ServingGroup inside one communication domain, so the
+      # ServingGroup anti-affinity below has one unambiguous domain to isolate.
+      groupPolicy:
+        mode: hard
+        highestTierName: communication-domain
+      # Keep all Pods of one Role replica (one SubJob) inside one node domain.
+      rolePolicy:
+        mode: hard
+        highestTierName: node
+
+    # topologyAffinity defines relationships between generated groups.
+    topologyAffinity:
+      servingGroupAntiAffinity:
+        required:
+        - topologyTierName: communication-domain
+      roleAffinity:
+        required:
+        - roles:
+          - prefill
+          - decode
+          topologyTierName: rack
+      roleAntiAffinity:
+        required:
+        # One role name means pairwise spread among replicas of that role.
+        - roles:
+          - prefill
+          topologyTierName: node
+        - roles:
+          - decode
+          topologyTierName: node
+
+    roles:
+    - name: prefill
+      replicas: 2
+      workerReplicas: 0
+      entryTemplate:
+        spec:
+          containers:
+          - name: prefill
+            image: busybox:1.36
+            command:
+            - sh
+            - -c
+            - sleep 360000
+            resources:
+              requests:
+                cpu: "1"
+                memory: 128Mi
+    - name: decode
+      replicas: 2
+      workerReplicas: 0
+      entryTemplate:
+        spec:
+          containers:
+          - name: decode
+            image: busybox:1.36
+            command:
+            - sh
+            - -c
+            - sleep 360000
+            resources:
+              requests:
+                cpu: "1"
+                memory: 128Mi
