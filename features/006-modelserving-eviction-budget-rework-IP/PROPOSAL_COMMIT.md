@@ -524,9 +524,68 @@ Expected behavior:
     `kubectl delete namespace eviction-006-role-per-role-minavailable --wait=false`.
   - No e2e tests were run.
 
+### 2026-08-05 PR #1485 CI fix proposal
+
+#### Failure evidence
+
+- PR: `https://github.com/volcano-sh/kthena/pull/1485`
+- Failing GitHub Actions check: `Go Check / build`
+- Run: `https://github.com/volcano-sh/kthena/actions/runs/30793991965`
+- `make lint` fails with `errcheck` at two response writes:
+  - `pkg/model-serving-controller/webhook/eviction_handler.go:116`
+  - `pkg/model-serving-controller/webhook/eviction_handler.go:1016`
+- Both failures are unchecked `http.ResponseWriter.Write` return values.
+- All reported Go tests and E2E jobs passed. The external `tide` check reports
+  `ERROR` without a details URL, so it is recorded but is not actionable from
+  the GitHub Actions log workflow.
+
+#### Proposed fix
+
+1. Check the error returned by both `w.Write(response)` calls.
+2. Log response write failures with `klog.Errorf`, matching existing webhook
+   response error handling without changing admission decisions or response
+   payloads.
+3. Keep the change scoped to the two CI-reported sites; no API, Helm, generated
+   file, or eviction-budget behavior changes are required.
+
+#### Verification plan
+
+1. Run `gofmt` on the changed Go file.
+2. Run the focused webhook package tests:
+   `go test ./pkg/model-serving-controller/webhook/...`.
+3. Run `make lint` to reproduce the failed CI gate locally.
+4. Run the mandatory non-e2e regression gate:
+   `go test $(go list ./... | grep -v /e2e)`.
+5. Recheck the local diff, record results below, and commit the approved fix.
+
+This is a response-error-handling-only CI fix. It does not change runtime
+eviction semantics, so the previously recorded Kind behavior verification
+remains applicable; no new Kind deployment is proposed for these two checked
+write calls.
+
+#### Verification results
+
+- Updated both CI-reported response writes to check the returned error and log
+  failures with `klog.Errorf`.
+- `gofmt -w pkg/model-serving-controller/webhook/eviction_handler.go` passed.
+- `git diff --check` passed.
+- `go test ./pkg/model-serving-controller/webhook/...` passed.
+- `make lint` passed, resolving the `Go Check / build` failure locally.
+- `go test $(go list ./... | grep -v /e2e)` passed.
+- No new Kind deployment was run because the fix only observes and logs an HTTP
+  response write failure; it does not change admission decisions, tracker state,
+  or eviction-budget behavior. The existing Kind verification above remains
+  applicable.
+- Kthena fix commit:
+  `f7b5ecbb75a9d2209b917b9c1858174df8e7cd61`.
+
 ## Associated Commits
 
 - Original commit under review:
   `187ea0629eea02435cbe847c624b8bdf2bae3d0e`
-- Implementation branch: `feat/006-modelserving-eviction-budget-rework`
-- Implementation commits: pending commit.
+- PR implementation commit:
+  `9f23214d22e1ca1a2f1251fad0fe3e0315769b1d`.
+- CI fix commit:
+  `f7b5ecbb75a9d2209b917b9c1858174df8e7cd61`.
+- Implementation branch:
+  `feat/006-modelserving-eviction-budget-rework-upstream`.
