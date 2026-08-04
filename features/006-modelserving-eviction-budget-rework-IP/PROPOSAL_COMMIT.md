@@ -577,7 +577,40 @@ write calls.
   or eviction-budget behavior. The existing Kind verification above remains
   applicable.
 - Kthena fix commit:
-  `f7b5ecbb75a9d2209b917b9c1858174df8e7cd61`.
+  `ce35051c10747590c0bc5b2686c7656a3551f2b2`.
+
+### 2026-08-05 PR #1485 conflict resolution
+
+- Fetched and merged `upstream/main` at
+  `ef18bbb711c7f6e55880da2a64fbcf3a8620dcdd` (21 upstream commits after the
+  branch merge base).
+- The only content conflict was in
+  `charts/kthena/charts/workload/templates/kthena-controller-manager/rbac/cluster-role.yaml`.
+- Resolved the RBAC conflict by:
+  - retaining the PR's cluster-wide ConfigMap permissions required by the
+    per-ModelServing disruption tracker;
+  - retaining upstream's least-privilege change that moves webhook Secret
+    permissions from the ClusterRole into a namespaced Role.
+- Final diff against the updated `upstream/main` remains scoped to the PR's 18
+  eviction-protection files.
+- Generation verification:
+  - CRD, object, client-go, CLI docs, CRD docs, and Helm docs generation ran and
+    produced no unstaged differences;
+  - `make generate` stopped only at the final copyright step because local
+    `sponge`/`moreutils` is unavailable on this macOS host.
+- Verification passed:
+  - `go test ./pkg/model-serving-controller/webhook/...`;
+  - `helm lint ./charts/kthena`;
+  - Helm rendering with the eviction webhook enabled, confirming tracker
+    ConfigMap access remains in the ClusterRole and Secret access is rendered in
+    the namespaced Role;
+  - `make lint`;
+  - `go test $(go list ./... | grep -v /e2e)`.
+- No new Kind deployment was run because the conflict resolution only combines
+  the existing tracker RBAC with upstream's Secret RBAC split; the feature's
+  previously recorded Kind verification remains applicable.
+- Signed-off merge commit:
+  `68a4ad00df94f233e0175548c4dcd6d022ef0494`.
 
 ## Associated Commits
 
@@ -586,6 +619,8 @@ write calls.
 - PR implementation commit:
   `9f23214d22e1ca1a2f1251fad0fe3e0315769b1d`.
 - CI fix commit:
-  `f7b5ecbb75a9d2209b917b9c1858174df8e7cd61`.
+  `ce35051c10747590c0bc5b2686c7656a3551f2b2`.
+- Upstream conflict-resolution merge commit:
+  `68a4ad00df94f233e0175548c4dcd6d022ef0494`.
 - Implementation branch:
   `feat/006-modelserving-eviction-budget-rework-upstream`.
