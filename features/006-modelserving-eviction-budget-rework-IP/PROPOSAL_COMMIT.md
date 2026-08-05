@@ -596,8 +596,10 @@ write calls.
 - Generation verification:
   - CRD, object, client-go, CLI docs, CRD docs, and Helm docs generation ran and
     produced no unstaged differences;
-  - `make generate` stopped only at the final copyright step because local
-    `sponge`/`moreutils` is unavailable on this macOS host.
+  - the initial `make generate` stopped only at the final copyright step because
+    local `sponge`/`moreutils` was unavailable on this macOS host;
+  - after installing `moreutils` with Homebrew, `make gen-check` passed end to
+    end, including copyright processing and the final `git diff --exit-code`.
 - Verification passed:
   - `go test ./pkg/model-serving-controller/webhook/...`;
   - `helm lint ./charts/kthena`;
