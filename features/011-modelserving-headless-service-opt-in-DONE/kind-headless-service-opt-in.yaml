@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: feature-011
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-managed-headless
+  namespace: feature-011
+  labels:
+    modelserving.volcano.sh/name: headless-opt-in
+spec:
+  clusterIP: None
+  selector:
+    app: user-managed
+---
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelServing
+metadata:
+  name: headless-opt-in
+  namespace: feature-011
+spec:
+  replicas: 2
+  schedulerName: volcano
+  template:
+    restartGracePeriodSeconds: 0
+    roles:
+      - name: serving
+        replicas: 2
+        entryTemplate:
+          spec:
+            containers:
+              - name: entry
+                image: kthena-controller-manager:dev-011
+                imagePullPolicy: IfNotPresent
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 3600
+        workerReplicas: 1
+        workerTemplate:
+          spec:
+            containers:
+              - name: worker
+                image: kthena-controller-manager:dev-011
+                imagePullPolicy: IfNotPresent
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 3600
