@@ -576,7 +576,7 @@ write calls.
   response write failure; it does not change admission decisions, tracker state,
   or eviction-budget behavior. The existing Kind verification above remains
   applicable.
-- Kthena fix commit:
+- Pre-squash Kthena fix commit:
   `ce35051c10747590c0bc5b2686c7656a3551f2b2`.
 
 ### 2026-08-05 PR #1485 conflict resolution
@@ -611,18 +611,31 @@ write calls.
 - No new Kind deployment was run because the conflict resolution only combines
   the existing tracker RBAC with upstream's Secret RBAC split; the feature's
   previously recorded Kind verification remains applicable.
-- Signed-off merge commit:
+- Pre-squash signed-off merge commit:
   `68a4ad00df94f233e0175548c4dcd6d022ef0494`.
+
+### 2026-08-05 Pre-submission history cleanup
+
+- Squashed the feature implementation, CI-only response-write fix, and upstream
+  conflict-resolution merge into one community-facing commit based directly on
+  `upstream/main` at `ef18bbb711c7f6e55880da2a64fbcf3a8620dcdd`.
+- Final squashed commit:
+  `ccd20c758f6802883583fd010a20d1470ffa2774`.
+- The final tree hash is
+  `f64d696aa94116d819cdf7e2b58c75bf287a6819`, identical to the previously
+  tested merge tree, so the recorded generation, lint, Helm, and Go test results
+  remain applicable.
+- The final commit includes `Signed-off-by: Min Chen <vanderchen@outlook.com>`.
+- Recovery branch `backup/pr-1485-before-squash-20260805` preserves the previous
+  history at `68a4ad00df94f233e0175548c4dcd6d022ef0494`.
 
 ## Associated Commits
 
 - Original commit under review:
   `187ea0629eea02435cbe847c624b8bdf2bae3d0e`
-- PR implementation commit:
-  `9f23214d22e1ca1a2f1251fad0fe3e0315769b1d`.
-- CI fix commit:
-  `ce35051c10747590c0bc5b2686c7656a3551f2b2`.
-- Upstream conflict-resolution merge commit:
-  `68a4ad00df94f233e0175548c4dcd6d022ef0494`.
+- Final squashed PR commit:
+  `ccd20c758f6802883583fd010a20d1470ffa2774`.
+- Superseded PR preparation commits are retained on
+  `backup/pr-1485-before-squash-20260805`.
 - Implementation branch:
   `feat/006-modelserving-eviction-budget-rework-upstream`.
