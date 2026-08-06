@@ -9,7 +9,7 @@ metadata:
   name: user-managed-headless
   namespace: feature-011
   labels:
-    modelserving.volcano.sh/name: headless-opt-in
+    modelserving.volcano.sh/name: headless-plugin
 spec:
   clusterIP: None
   selector:
@@ -18,7 +18,7 @@ spec:
 apiVersion: workload.serving.volcano.sh/v1alpha1
 kind: ModelServing
 metadata:
-  name: headless-opt-in
+  name: headless-plugin
   namespace: feature-011
 spec:
   replicas: 2

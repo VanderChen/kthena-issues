@@ -1,0 +1,20 @@
+apiVersion: workload.serving.volcano.sh/v1alpha1
+kind: ModelBooster
+metadata:
+  name: booster-headless-plugin
+  namespace: feature-011
+spec:
+  backend:
+    name: backend
+    type: vLLM
+    modelURI: hf://example/test-model
+    cacheURI: hostpath://tmp/cache
+    minReplicas: 1
+    maxReplicas: 1
+    workers:
+      - type: server
+        image: kthena-controller-manager:dev-011
+        replicas: 1
+        pods: 2
+        config:
+          served-model-name: test-model
