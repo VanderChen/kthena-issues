@@ -12,19 +12,21 @@ Target implementation branch:
 feat/011-modelserving-headless-service-opt-in
 ```
 
-The branch contains the superseded implementation commit:
+The branch initially contained the superseded implementation commit:
 
 ```text
 ab2cd1548238bf424ff379676d279fc97a3d9638
 ```
 
-The revised signed-off implementation commit is:
+That commit was dropped from the final branch history. The revised signed-off
+implementation was rebuilt directly on `origin/main` as the single commit:
 
 ```text
-eada4733652cbd19fa332b6cfec99f0737e474d8
+39313eb0348bc1b66754f33c2c3ed37218ea6297
 ```
 
-Both commits remain in branch history so the design change is auditable.
+The final tree is byte-for-byte identical to the previously verified tree; only
+the two-commit feature history was replaced by this single final commit.
 
 ## Revised Design Decisions
 
@@ -364,7 +366,7 @@ tracked diff SHA-256 after:  9384b5e5b13ca25fd5595d94a2ac1aa7f76c7195cffab47170d
 still uncommitted, so its final `git diff --exit-code` correctly reported that
 diff. The generator itself completed, and the repeated identical diff hashes
 above proved it made no further changes. It was run again after implementation
-commit `eada4733` and passed with a clean `git diff --exit-code`.
+implementation commit and passed with a clean `git diff --exit-code`.
 
 ## Kind Verification Results
 
@@ -450,7 +452,7 @@ Helm release were removed after verification.
 
 ```text
 Kthena implementation:
-eada4733652cbd19fa332b6cfec99f0737e474d8
+39313eb0348bc1b66754f33c2c3ed37218ea6297
 feat: manage headless services through plugin hooks
 
 Issues task record:

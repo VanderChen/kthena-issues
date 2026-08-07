@@ -3,10 +3,11 @@
 ## Status
 
 DONE — revised plugin lifecycle design implemented and verified in signed-off
-Kthena commit `eada4733652cbd19fa332b6cfec99f0737e474d8`.
+Kthena commit `39313eb0348bc1b66754f33c2c3ed37218ea6297`.
 
 The earlier `spec.enableHeadlessService` design and implementation commit
-`ab2cd1548238bf424ff379676d279fc97a3d9638` are superseded by this revision.
+`ab2cd1548238bf424ff379676d279fc97a3d9638` were superseded and dropped from
+the final feature branch history.
 
 ## Summary
 
