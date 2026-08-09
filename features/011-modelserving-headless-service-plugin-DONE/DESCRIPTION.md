@@ -2,8 +2,8 @@
 
 ## Status
 
-DONE — revised plugin lifecycle design implemented and verified in signed-off
-Kthena commit `39313eb0348bc1b66754f33c2c3ed37218ea6297`.
+DONE — implemented and verified with the existing unified `HookRequest` and
+`Plugin` interface for all lifecycle hooks.
 
 The earlier `spec.enableHeadlessService` design and implementation commit
 `ab2cd1548238bf424ff379676d279fc97a3d9638` were superseded and dropped from
@@ -58,10 +58,11 @@ resource and prevents Service implementations from evolving independently.
   ModelServing UID.
 - Services must not participate in `isServingGroupDeleted` or `isRoleDeleted`.
   Core deletion completes based on core workload resources only.
-- Reuse the existing `OnPodCreate` hook for initial Service creation, and extend
-  existing Role lifecycle paths with narrow optional hooks: an idempotent
-  active-Role hook for recovery and a Role delete hook for scale-down/rollout
-  cleanup. Do not add a ModelServing-wide reconcile hook.
+- Reuse the existing `OnPodCreate` hook for initial Service creation, extend the
+  existing `HookRequest` with Role lifecycle context, and add `OnRoleSync` and
+  `OnRoleDelete` directly to the existing `Plugin` interface. Do not introduce
+  separate Role request/capability interfaces or a ModelServing-wide reconcile
+  hook.
 - Service lifecycle failures are returned from the plugin hook so the normal
   ModelServing workqueue retry policy applies.
 - Adding or removing the plugin must not roll or restart Pods. Removing the

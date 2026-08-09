@@ -2,9 +2,8 @@
 
 ## Status
 
-DONE. Approved, implemented, and verified. The
-revised design was approved when the user requested implementation and
-verification after removing the plugin-removal hook concept.
+DONE. The plugin implementation and its unified lifecycle interface have been
+implemented, tested, and verified in Kind.
 
 Target implementation branch:
 
@@ -19,14 +18,12 @@ ab2cd1548238bf424ff379676d279fc97a3d9638
 ```
 
 That commit was dropped from the final branch history. The revised signed-off
-implementation was rebuilt directly on `origin/main` as the single commit:
+implementation, including the unified `HookRequest` and `Plugin` lifecycle
+contract, is represented by the single commit:
 
 ```text
-39313eb0348bc1b66754f33c2c3ed37218ea6297
+d7a56e3e8f302246978fa4958cc0529e579636aa
 ```
-
-The final tree is byte-for-byte identical to the previously verified tree; only
-the two-commit feature history was replaced by this single final commit.
 
 ## Revised Design Decisions
 
@@ -37,9 +34,10 @@ the two-commit feature history was replaced by this single final commit.
    attached to existing Role creation/reconciliation and deletion paths.
 4. Services are auxiliary resources and are never used to decide whether a
    ServingGroup or Role still exists.
-5. There is no ModelServing-wide reconcile hook. The plugin framework gains
-   optional Role lifecycle interfaces, so existing Pod plugins are not forced
-   to implement unrelated resource lifecycle methods.
+5. There is no ModelServing-wide reconcile hook. The existing `HookRequest` and
+   `Plugin` interface are extended with Role lifecycle context and hooks, so
+   future lifecycle implementations use one stable plugin contract rather than
+   capability-specific request and interface types.
 
 ## Current Coupling to Remove
 
@@ -87,45 +85,38 @@ independently own the same Service names.
 
 ## Plugin Framework Extension
 
-### Capability interfaces
+### Unified lifecycle interface
 
 `ReconcileModelServing` is not an existing controller call point and is too
-broad for this feature. Keep the current `Plugin` interface and its existing
-Pod hooks unchanged, then add small optional capability interfaces:
+broad for this feature. Extend the existing request and interface directly:
 
 ```go
-type Plugin interface {
-    Name() string
-    OnPodCreate(context.Context, *PodHookRequest) error
-    OnPodReady(context.Context, *PodHookRequest) error
-}
-
-type RoleLifecyclePlugin interface {
-    OnRoleSync(context.Context, *RoleHookRequest) error
-    OnRoleDelete(context.Context, *RoleHookRequest) error
-}
-
-```
-
-The exact Go names may be adjusted to match repository naming conventions.
-Existing `demo-pod-tweaks` and `lws-standard-labels` remain unchanged because
-the new interfaces are discovered with type assertions. The Headless Service
-plugin reuses the existing `OnPodCreate` hook for initial creation and
-implements the optional Role lifecycle hooks for recovery and deletion.
-
-The Role request contains only the context already available in the current
-Role management functions:
-
-```go
-type RoleHookRequest struct {
+type HookRequest struct {
     ModelServing *workloadv1alpha1.ModelServing
     ServingGroup string
     RoleName     string
     RoleID       string
     RoleIndex    int
     Role         *workloadv1alpha1.Role
+    IsEntry      bool
+    Pod          *corev1.Pod
+}
+
+type Plugin interface {
+    Name() string
+    OnPodCreate(context.Context, *HookRequest) error
+    OnPodReady(context.Context, *HookRequest) error
+    OnRoleSync(context.Context, *HookRequest) error
+    OnRoleDelete(context.Context, *HookRequest) error
 }
 ```
+
+`demo-pod-tweaks` and `lws-standard-labels` implement no-op Role hooks. The
+Headless Service plugin reuses `OnPodCreate` for initial creation and implements
+the Role hooks for recovery and deletion. A single request type keeps common
+ModelServing, ServingGroup, and Role context available as additional lifecycle
+hooks are added later; hook-specific fields such as `Pod` may be nil when they
+do not apply.
 
 Kubernetes clients and the cache-backed Service lister/indexer are injected into
 the plugin factory by the plugin manager. The hook request does not expose the
@@ -241,8 +232,8 @@ through `make generate`.
 
 ### Plugin manager tests
 
-- optional dispatch for Role lifecycle hooks while the existing Pod hook
-  interface remains compatible;
+- unified dispatch for Pod and Role lifecycle hooks through `Plugin` and
+  `HookRequest`;
 - existing plugin ordering and scope behavior remains stable;
 - `OnRoleSync` and `OnRoleDelete` execute only for configured plugins;
 - duplicate lifecycle plugin entries and invalid target scope fail clearly;
@@ -308,8 +299,8 @@ status transitions here before returning the task to `DONE`.
 - Removed the superseded `EnableHeadlessService` API field and regenerated the
   workload CRD, apply configurations, and CRD reference documentation.
 - Added the built-in `headless-service` plugin. Initial creation uses the
-  existing `OnPodCreate` call; recovery and cleanup use the narrow optional
-  `OnRoleSync` and `OnRoleDelete` capability interface.
+  existing `OnPodCreate` call; recovery and cleanup use `OnRoleSync` and
+  `OnRoleDelete` on the unified `Plugin` interface.
 - Added dependency injection for the Kubernetes client and cache-backed Service
   lister. No controller datastore is exposed to plugins.
 - Added Role-delete cleanup registration so Services created under an earlier
@@ -448,11 +439,55 @@ and installed with the workload Helm subchart. Volcano was already running.
 The isolated `feature-011` namespace, temporary finalizer, ModelBooster, and
 Helm release were removed after verification.
 
+## Unified Interface Follow-up Verification
+
+After replacing `RoleHookRequest` and `RoleLifecyclePlugin` with the shared
+`HookRequest` and `Plugin` contract, the following gates were rerun:
+
+```text
+go test ./pkg/model-serving-controller/plugins ./pkg/model-serving-controller/controller ./pkg/model-booster-controller/convert
+ok  all selected packages
+
+go test $(go list ./... | grep -v /e2e)
+ok  all selected packages
+
+make lint
+passed
+
+make generate
+tracked diff SHA-256 before: 6461ca00ea55fec9d2da859ed0d9896c083407804ad8a3a392cbf1f1a25c1e56
+tracked diff SHA-256 after:  6461ca00ea55fec9d2da859ed0d9896c083407804ad8a3a392cbf1f1a25c1e56
+
+make gen-check
+passed on the clean implementation commit
+```
+
+The follow-up Kind run used image
+`kthena-controller-manager:dev-011-unified` with image ID
+`sha256:d74dda73fcf9921199d685d0c998f8db311278e0ed54e5c16e31fcef125dd8e7`.
+It confirmed:
+
+- no generated Service before the plugin was enabled;
+- enabling the plugin created 4 Services while all 8 Pod UIDs stayed unchanged;
+- deleting `headless-plugin-0-serving-0-0` recreated it with UID
+  `454ab9e5-237c-47dd-9a2e-ebd5499c2979`, replacing UID
+  `fc21b6f8-53a6-484c-8fa6-9b7b35f0c676`;
+- removing the plugin preserved existing Services and did not restart Pods;
+- scaling Role replicas from 2 to 1 cleaned both `serving-1` Services through
+  `OnRoleDelete` even though the plugin was no longer configured;
+- deleting a remaining generated Service after plugin removal did not recreate
+  it, while `user-managed-headless` remained present;
+- controller logs showed both obsolete Roles reaching deleted state and no
+  lifecycle hook errors.
+
+The follow-up `feature-011` namespace and Helm release were removed after the
+verification.
+
 ## Commits
 
 ```text
 Kthena implementation:
-39313eb0348bc1b66754f33c2c3ed37218ea6297
+d7a56e3e8f302246978fa4958cc0529e579636aa
 feat: manage headless services through plugin hooks
 
 Issues task record:
