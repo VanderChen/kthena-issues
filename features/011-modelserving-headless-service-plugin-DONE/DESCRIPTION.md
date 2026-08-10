@@ -2,8 +2,10 @@
 
 ## Status
 
-DONE — implemented and verified with the existing unified `HookRequest` and
-`Plugin` interface for all lifecycle hooks.
+DONE — Kubernetes client and lister access use the unified `HookRequest`,
+matching the `pod-ranktable-plugin` runtime dependency pattern. The final
+implementation is verified and pushed as commit
+`5c522864b1c1db10a248460539b570c04909afd9`.
 
 The earlier `spec.enableHeadlessService` design and implementation commit
 `ab2cd1548238bf424ff379676d279fc97a3d9638` were superseded and dropped from
@@ -63,6 +65,9 @@ resource and prevents Service implementations from evolving independently.
   `OnRoleDelete` directly to the existing `Plugin` interface. Do not introduce
   separate Role request/capability interfaces or a ModelServing-wide reconcile
   hook.
+- Put the Kubernetes client and Service lister on `HookRequest`, following the
+  `pod-ranktable-plugin` pattern. Do not add a separate plugin dependency
+  container or pass runtime clients into plugin factories.
 - Service lifecycle failures are returned from the plugin hook so the normal
   ModelServing workqueue retry policy applies.
 - Adding or removing the plugin must not roll or restart Pods. Removing the

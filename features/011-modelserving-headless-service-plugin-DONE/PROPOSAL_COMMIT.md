@@ -2,8 +2,9 @@
 
 ## Status
 
-DONE. The plugin implementation and its unified lifecycle interface have been
-implemented, tested, and verified in Kind.
+DONE. The `pod-ranktable-plugin` runtime dependency alignment is implemented,
+verified, committed, and pushed: Kubernetes clients and listers are supplied
+through `HookRequest`, not plugin factory dependencies.
 
 Target implementation branch:
 
@@ -22,7 +23,7 @@ implementation, including the unified `HookRequest` and `Plugin` lifecycle
 contract, is represented by the single commit:
 
 ```text
-d7a56e3e8f302246978fa4958cc0529e579636aa
+5c522864b1c1db10a248460539b570c04909afd9
 ```
 
 ## Revised Design Decisions
@@ -100,6 +101,8 @@ type HookRequest struct {
     Role         *workloadv1alpha1.Role
     IsEntry      bool
     Pod          *corev1.Pod
+    KubeClient    kubernetes.Interface
+    ServiceLister corelisters.ServiceLister
 }
 
 type Plugin interface {
@@ -118,9 +121,13 @@ ModelServing, ServingGroup, and Role context available as additional lifecycle
 hooks are added later; hook-specific fields such as `Pod` may be nil when they
 do not apply.
 
-Kubernetes clients and the cache-backed Service lister/indexer are injected into
-the plugin factory by the plugin manager. The hook request does not expose the
-controller datastore or add resource fields to `ModelServingSpec`.
+Following the `pod-ranktable-plugin` branch pattern, the plugin factory receives
+only `PluginSpec`. The Kubernetes client and cache-backed Service lister are
+provided on each `HookRequest`. This keeps plugin construction configuration-only
+and makes runtime controller resources available uniformly to future lifecycle
+plugins without introducing a separate dependency container. The hook request
+does not expose the controller datastore or add resource fields to
+`ModelServingSpec`.
 
 ### Hook placement
 
@@ -301,8 +308,9 @@ status transitions here before returning the task to `DONE`.
 - Added the built-in `headless-service` plugin. Initial creation uses the
   existing `OnPodCreate` call; recovery and cleanup use `OnRoleSync` and
   `OnRoleDelete` on the unified `Plugin` interface.
-- Added dependency injection for the Kubernetes client and cache-backed Service
-  lister. No controller datastore is exposed to plugins.
+- Added the Kubernetes client and cache-backed Service lister to `HookRequest`,
+  following the runtime resource pattern in `pod-ranktable-plugin`. Plugin
+  factories remain configuration-only and no controller datastore is exposed.
 - Added Role-delete cleanup registration so Services created under an earlier
   plugin configuration are cleaned only when their Role is deleted, even if the
   plugin was removed or its scope changed.
@@ -483,11 +491,64 @@ It confirmed:
 The follow-up `feature-011` namespace and Helm release were removed after the
 verification.
 
+## HookRequest Runtime Resources Follow-up Verification
+
+The implementation was aligned with the `pod-ranktable-plugin` branch:
+
+- removed `Dependencies` from the plugin package;
+- changed `Factory` and all built-in plugin constructors to accept only
+  `PluginSpec`;
+- added `KubeClient` and `ServiceLister` to the shared `HookRequest`;
+- populated both fields at Pod create/ready, Role sync, and Role delete call
+  points;
+- changed `headless-service` to use only runtime resources from each request;
+- moved missing-client validation from construction to the hooks that require
+  Kubernetes API access.
+
+Verification gates:
+
+```text
+go test ./pkg/model-serving-controller/plugins ./pkg/model-serving-controller/controller ./pkg/model-booster-controller/convert
+ok  all selected packages
+
+go test $(go list ./... | grep -v /e2e)
+ok  all selected packages
+
+make lint
+passed
+
+make generate
+tracked diff SHA-256 before: f7c9273f397a2c42382bc6c16766eacb6868734f1f333752a1c96c706f38653a
+tracked diff SHA-256 after:  f7c9273f397a2c42382bc6c16766eacb6868734f1f333752a1c96c706f38653a
+
+make gen-check
+passed on the clean final implementation commit
+```
+
+Kind verification used image `kthena-controller-manager:dev-011-hookrequest`
+with image ID
+`sha256:b58daab34519f9635227c08598c4ccc90e29042ac03e92fcd47ce063458319e9`.
+Observed results:
+
+- without the plugin, only `user-managed-headless` existed;
+- enabling the plugin created exactly 4 Headless Services;
+- deleting `headless-plugin-0-serving-0-0` replaced UID
+  `df97bf65-74d0-4b87-9cf1-83d170684173` with
+  `342e0636-0898-42c7-95ca-e6a86201d9b0`, verifying `OnRoleSync` could use
+  the request client/lister;
+- after plugin removal, scaling Role replicas from 2 to 1 deleted both
+  `serving-1` Services through `OnRoleDelete` while preserving both active
+  `serving-0` Services and `user-managed-headless`;
+- controller logs showed both deleted Roles returning their ServingGroups to
+  `Running` with no plugin runtime resource errors.
+
+The verification namespace and Helm release were removed afterward.
+
 ## Commits
 
 ```text
 Kthena implementation:
-d7a56e3e8f302246978fa4958cc0529e579636aa
+5c522864b1c1db10a248460539b570c04909afd9
 feat: manage headless services through plugin hooks
 
 Issues task record:
